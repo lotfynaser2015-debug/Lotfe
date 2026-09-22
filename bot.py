@@ -479,30 +479,22 @@ async def _experts_exec_yes(query, context, tid):
 
 
 def pf_keyboard(pf_id: int, is_running: bool, experts_enabled: bool = False):
+    """واجهة محفظة مبسّطة — إعادة بناء المراكز تغطي الناقص/الاستوبات."""
     rows = []
     if is_running:
         rows.append([InlineKeyboardButton("⏹ إيقاف المحفظة", callback_data=f"stop_{pf_id}")])
     else:
         rows.append([InlineKeyboardButton("▶️ تشغيل المحفظة", callback_data=f"start_{pf_id}")])
-    # خبراء — تحكم كامل داخل المحفظة
     rows.append([InlineKeyboardButton(
         "🧠 خبراء المحفظة",
         callback_data=f"pf_experts_{pf_id}",
     )])
     rows.append([
-        InlineKeyboardButton("📈 زيادة رأس المال", callback_data=f"increase_{pf_id}"),
         InlineKeyboardButton("🎯 أهداف TP/SL", callback_data=f"pf_tpsl_{pf_id}"),
-    ])
-    rows.append([
         InlineKeyboardButton("♻️ إعادة بناء المراكز", callback_data=f"rebuild_{pf_id}"),
     ])
     rows.append([
         InlineKeyboardButton("🔄 تحديث الأهداف", callback_data=f"refresh_tpsl_{pf_id}"),
-        InlineKeyboardButton("📊 الإحصائيات", callback_data=f"stats_{pf_id}"),
-    ])
-    rows.append([
-        InlineKeyboardButton("🛑 الاستوبات / إعادة دخول", callback_data=f"stopped_{pf_id}"),
-        InlineKeyboardButton("🔎 عملات ناقصة", callback_data=f"missing_{pf_id}"),
     ])
     rows.append([
         InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
@@ -1855,93 +1847,44 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.close()
         return
 
+    # الأزرار القديمة (إحصائيات / ناقصة / استوبات) → إعادة بناء المراكز
     if data.startswith("stats_"):
         pf_id = int(data.split("_")[1])
-        db = SessionLocal()
-        try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
-                return
-            events = get_portfolio_trade_events(db, pf_id, tid)
-            prices = {}
-            symbols = [
-                c.symbol for c in p.coins
-                if c.position_status in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit")
-            ]
-            if symbols:
-                try:
-                    prices = get_mexc().get_all_prices(symbols)
-                except Exception:
-                    prices = {}
-            await query.edit_message_text(
-                format_portfolio_stats(p, events, prices),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 تحديث الإحصائيات", callback_data=f"stats_{pf_id}")],
-                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
-                ]),
-            )
-        finally:
-            db.close()
+        await query.edit_message_text(
+            "ℹ️ تم دمج الإحصائيات والتفاصيل داخل شاشة المحفظة.\n"
+            "لضبط المراكز والأهداف استخدم *♻️ إعادة بناء المراكز*.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("♻️ إعادة بناء المراكز", callback_data=f"rebuild_{pf_id}")],
+                [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+            ]),
+        )
         return
 
-    if data.startswith("missing_toggle_"):
-        parts = data.split("_", 3)
-        if len(parts) != 4:
+    if data.startswith("missing_toggle_") or data.startswith("missing_confirm_") or data.startswith("missing_"):
+        try:
+            if data.startswith("missing_toggle_"):
+                pf_id = int(data.split("_")[2])
+            else:
+                pf_id = int(data.split("_")[1])
+        except (IndexError, ValueError):
             await query.edit_message_text("طلب غير صالح.", reply_markup=main_menu_keyboard())
             return
-        await _show_missing_reentry(query, context, tid, int(parts[2]), parts[3])
-        return
-
-    if data.startswith("missing_confirm_"):
-        await _do_missing_reentry(query, context, tid, int(data.split("_")[2]))
-        return
-
-    if data.startswith("missing_"):
-        await _show_missing_reentry(query, context, tid, int(data.split("_")[1]))
+        await query.edit_message_text(
+            "ℹ️ العملات الناقصة صارت جزء من *♻️ إعادة بناء المراكز*.\nجاري التنفيذ...",
+            parse_mode="Markdown",
+        )
+        await _do_rebuild_positions(query, tid, pf_id)
         return
 
     if data.startswith("stopped_"):
         pf_id = int(data.split("_")[1])
-        db = SessionLocal()
-        try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
-                return
-            candidates = get_reentry_candidates(db, pf_id, tid)
-            if not candidates:
-                await query.edit_message_text(
-                    f"🛑 لا توجد عملات متاحة لإعادة الدخول في *{p.name}*.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
-                    ]),
-                )
-                return
-            lines = [f"🛑 *عملات ضربت الاستوب — {p.name}*", "", "اختر العملة لإعادة دخولها يدوياً:"]
-            buttons = []
-            for event in candidates:
-                pnl = float(event.realized_pnl or 0)
-                lines.append(
-                    f"• `{event.symbol}` — خروج `{event.exit_price:.6g}` — "
-                    f"نتيجة `{pnl:+.2f}` USDT"
-                )
-                buttons.append([
-                    InlineKeyboardButton(
-                        f"🔄 إعادة دخول {event.symbol}",
-                        callback_data=f"reentry_{event.id}",
-                    )
-                ])
-            buttons.append([InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")])
-            await query.edit_message_text(
-                "\n".join(lines),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
-        finally:
-            db.close()
+        await query.edit_message_text(
+            "ℹ️ الاستوبات وإعادة الدخول صارت تلقائية + عبر *♻️ إعادة بناء المراكز*.\n"
+            "جاري إعادة البناء...",
+            parse_mode="Markdown",
+        )
+        await _do_rebuild_positions(query, tid, pf_id)
         return
 
     if data == "balance":
@@ -2394,10 +2337,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if data.startswith("increase_"):
-        context.user_data["increase_pf"] = int(data.split("_")[1])
-        context.user_data["waiting"] = True
-        await query.edit_message_text("أرسل مبلغ الزيادة بالـ USDT:")
-        return INCREASE_AMOUNT
+        pf_id = int(data.split("_")[1])
+        await query.edit_message_text(
+            "ℹ️ زيادة رأس المال صارت عبر *♻️ إعادة بناء المراكز*:\n"
+            "يكمّل الناقص من رصيد USDT المتاح ويعيد الأهداف الذكية.\n"
+            "حوّل USDT للحساب ثم اضغط الزر.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("♻️ إعادة بناء المراكز", callback_data=f"rebuild_{pf_id}")],
+                [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+            ]),
+        )
+        return
     if data.startswith("addcoin_"):
         context.user_data["addcoin_pf"] = int(data.split("_")[1])
         context.user_data["waiting"] = True
@@ -2764,9 +2715,19 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 if use_amt <= 0 or entry <= 0:
                     refresh_errors.append(f"{coin.symbol}: لا يوجد رصيد كافٍ")
                     continue
+                # أهداف ذكية لكل عملة حسب سلوكها
+                try:
+                    levels = reb.build_smart_levels_for_entry(
+                        coin.symbol, entry, tp1, tp2, tp3, sl_pct,
+                    )
+                    use_tp1, use_tp2, use_tp3, use_sl = (
+                        levels.tp1_pct, levels.tp2_pct, levels.tp3_pct, levels.stop_loss_pct,
+                    )
+                except Exception:
+                    use_tp1, use_tp2, use_tp3, use_sl = tp1, tp2, tp3, sl_pct
                 result = reb.place_tp_orders(
                     [{"symbol": coin.symbol, "amount": use_amt, "entry_price": entry}],
-                    tp1, tp2, tp3, sl_pct, s1, s2,
+                    use_tp1, use_tp2, use_tp3, use_sl, s1, s2,
                 )[0]
                 if result.get("error"):
                     refresh_errors.append(f"{coin.symbol}: {result['error']}")
@@ -2785,6 +2746,9 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     tp2_order_id=result.get("tp2_order_id"),
                     tp3_order_id=result.get("tp3_order_id"),
                     position_status="open",
+                    reentry_used=False,
+                    reentry_touched=False,
+                    reentry_price=0.0,
                 )
                 refreshed.append(coin.symbol)
             except Exception as exc:
@@ -2809,8 +2773,8 @@ async def _do_rebuild_positions(query, tid, pf_id):
             f"🛒 عملات جديدة: `{len(bought)}`" + (f" — {', '.join(f'`{x}`' for x in bought)}" if bought else ""),
             f"📈 تم تكميل: `{len(topped)}`" + (f" — {', '.join(f'`{x}`' for x in topped[:8])}" if topped else ""),
             f"💵 صُرف من الحساب: `{total_spent:.2f}$` | USDT متبقي: `{free_after:.2f}$`",
-            f"🎯 أهداف وُضعت لـ: `{len(refreshed)}` عملة",
-            f"TP1 `{tp1}%` · TP2 `{tp2}%` · TP3 `{tp3}%` · SL `{sl_pct}%`",
+            f"🎯 أهداف ذكية وُضعت لـ: `{len(refreshed)}` عملة",
+            "(كل عملة حسب ATR والاتجاه — مع حد أدنى لحماية مساحة البامب)",
         ]
         all_errs = cancel_errors[:3] + buy_errors + refresh_errors
         if all_errs:
