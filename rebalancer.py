@@ -1,8 +1,20 @@
 from typing import Dict, List, Optional, Any
 from mexc_client import MexcClient
 import logging
+from smart_levels import (
+    compute_smart_levels,
+    trailing_stop_price,
+    reentry_trigger_price,
+)
 
 logger = logging.getLogger(__name__)
+
+# Auto re-entry: price must recover this % above the stop that was hit
+REENTRY_RECOVER_PCT = 1.2
+# Minimum minutes after stop before auto re-entry is allowed (soft; enforced in bot if needed)
+REENTRY_COOLDOWN_HINT_MIN = 20
+# Trailing distance when ATR is unknown (percent)
+DEFAULT_TRAIL_PCT = 1.5
 
 
 class Rebalancer:
@@ -11,6 +23,35 @@ class Rebalancer:
     def __init__(self, client: MexcClient):
         self.client = client
         self.quote = client.quote
+
+    def fetch_candles(self, symbol: str, timeframe: str = "1h", limit: int = 80) -> List:
+        pair = f"{symbol}/{self.quote}"
+        try:
+            return self.client.exchange.fetch_ohlcv(pair, timeframe=timeframe, limit=limit) or []
+        except Exception as e:
+            logger.warning("OHLCV failed for %s: %s", symbol, e)
+            return []
+
+    def build_smart_levels_for_entry(
+        self,
+        symbol: str,
+        entry: float,
+        fallback_tp1: float = 3.0,
+        fallback_tp2: float = 5.0,
+        fallback_tp3: float = 8.0,
+        fallback_sl: float = 3.0,
+        timeframe: str = "1h",
+    ):
+        candles = self.fetch_candles(symbol, timeframe=timeframe, limit=80)
+        return compute_smart_levels(
+            symbol,
+            entry,
+            candles,
+            fallback_tp1=fallback_tp1,
+            fallback_tp2=fallback_tp2,
+            fallback_tp3=fallback_tp3,
+            fallback_sl=fallback_sl,
+        )
 
     def calculate_targets(self, coins: List[str], method: str = "equal") -> Dict[str, float]:
         if not coins:
@@ -319,27 +360,15 @@ class Rebalancer:
             if price <= 0:
                 continue
 
-            # ----- waiting for re-entry -----
+            # ----- waiting for auto re-entry (simple) -----
+            # Trigger when price recovers REENTRY_RECOVER_PCT above the stored level.
             if status == "waiting_reentry":
                 if getattr(coin, "reentry_used", False):
                     continue
                 reentry = float(getattr(coin, "reentry_price", 0) or 0)
                 if reentry <= 0:
                     continue
-                # Step 1: touch the zone (price <= reentry)
-                if not getattr(coin, "reentry_touched", False):
-                    if price <= reentry:
-                        actions.append({
-                            "coin_id": getattr(coin, "id", None),
-                            "symbol": symbol,
-                            "action": "reentry_touched",
-                            "price": price,
-                            "reentry_price": reentry,
-                        })
-                    continue
-                # Step 2: bounce +1% above reentry → buy again
-                bounce = reentry * 1.01
-                if price >= bounce:
+                if price >= reentry:
                     actions.append({
                         "coin_id": getattr(coin, "id", None),
                         "symbol": symbol,
@@ -356,9 +385,8 @@ class Rebalancer:
                     "coin_id": getattr(coin, "id", None),
                     "symbol": symbol,
                     "action": "tp1_hit",
-                    # TP1 must move the stop to the original entry price
-                    # (break-even), not to the TP1 price.
-                    "new_sl": coin.entry_price,
+                    # TP1 → break-even (entry)
+                    "new_sl": float(coin.entry_price or 0),
                     "price": price,
                     "filled_amount": tp1_fill.get("filled", 0.0),
                     "fill_price": tp1_fill.get("average") or coin.tp1_price,
@@ -366,11 +394,17 @@ class Rebalancer:
                 continue
             tp2_fill = self._filled_order_info(getattr(coin, "tp2_order_id", None), symbol)
             if status in ("open", "tp1_hit") and tp2_fill:
+                # After TP2: protect profit by moving SL to TP1 (not to TP2 itself).
+                # This avoids the "raise SL to TP2 → instant stop-out" bug.
+                protect = float(coin.tp1_price or 0) or float(coin.entry_price or 0)
+                entry = float(coin.entry_price or 0)
+                if protect < entry:
+                    protect = entry
                 actions.append({
                     "coin_id": getattr(coin, "id", None),
                     "symbol": symbol,
                     "action": "tp2_hit",
-                    "new_sl": coin.tp2_price,
+                    "new_sl": protect,
                     "price": price,
                     "filled_amount": tp2_fill.get("filled", 0.0),
                     "fill_price": tp2_fill.get("average") or coin.tp2_price,
@@ -387,6 +421,28 @@ class Rebalancer:
                     "fill_price": tp3_fill.get("average") or coin.tp3_price,
                 })
                 continue
+
+            # ----- trailing stop after TP2 (remaining runner) -----
+            if status == "tp2_hit":
+                sl_now = float(coin.current_sl_price or 0)
+                # Trail only while price is above protected level
+                new_trail = trailing_stop_price(
+                    price,
+                    sl_now,
+                    atr=0.0,
+                    trail_atr_mult=1.1,
+                    min_trail_pct=DEFAULT_TRAIL_PCT,
+                )
+                # Only emit when meaningfully higher (avoid spam from noise)
+                if new_trail > sl_now * 1.0015:
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "trail_update",
+                        "new_sl": new_trail,
+                        "price": price,
+                    })
+                    # do not continue — still allow SL check below with old sl this cycle
 
             # ----- stop loss -----
             sl = float(coin.current_sl_price or 0)
@@ -431,9 +487,9 @@ class Rebalancer:
                     dust = True
 
                 was_raised = status in ("tp1_hit", "tp2_hit", "tp3_hit", "tp_hit")
-                orig_sl = float(getattr(coin, "original_sl_price", 0) or 0)
-                # A stop creates a manual re-entry candidate. The user must
-                # explicitly choose whether to buy this coin again.
+                already_used = bool(getattr(coin, "reentry_used", False))
+                # Auto re-entry trigger = stop level recovered by REENTRY_RECOVER_PCT
+                trigger = reentry_trigger_price(sl if sl > 0 else price, REENTRY_RECOVER_PCT)
                 actions.append({
                     "coin_id": getattr(coin, "id", None),
                     "symbol": symbol,
@@ -444,8 +500,9 @@ class Rebalancer:
                     "sold": sold,
                     "dust": dust,
                     "was_raised": was_raised,
-                    "reentry_price": orig_sl,
-                    "reentry_available": bool(orig_sl > 0 and not getattr(coin, "reentry_used", False)),
+                    "reentry_price": trigger,
+                    "reentry_available": bool(trigger > 0 and not already_used),
+                    "auto_reentry": True,
                 })
         return actions
 
@@ -459,8 +516,9 @@ class Rebalancer:
         stop_loss_pct: float,
         tp1_sell_pct: float = 40.0,
         tp2_sell_pct: float = 30.0,
+        use_smart: bool = True,
     ) -> Dict:
-        """Market buy then place multi-TP limits for a re-entry."""
+        """Market buy then place multi-TP limits for a re-entry (smart levels by default)."""
         result = {"symbol": symbol, "error": None}
         try:
             order = self.client.create_market_buy_usdt(symbol, usdt_amount)
@@ -472,15 +530,24 @@ class Rebalancer:
         time.sleep(1.0)
         amount = self.client.get_free_amount(symbol) * 0.998
         entry = self.client.get_ticker_price(f"{symbol}/{self.quote}")
+        if use_smart and entry > 0:
+            try:
+                levels = self.build_smart_levels_for_entry(
+                    symbol, entry, tp1_pct, tp2_pct, tp3_pct, stop_loss_pct,
+                )
+                tp1_pct = levels.tp1_pct
+                tp2_pct = levels.tp2_pct
+                tp3_pct = levels.tp3_pct
+                stop_loss_pct = levels.stop_loss_pct
+                result["smart_reason"] = levels.reason
+            except Exception as e:
+                logger.warning("smart levels failed on reentry %s: %s", symbol, e)
         placed = self.place_tp_orders(
             [{"symbol": symbol, "amount": amount, "entry_price": entry}],
             tp1_pct, tp2_pct, tp3_pct, stop_loss_pct, tp1_sell_pct, tp2_sell_pct,
         )
         if placed:
             result.update(placed[0])
-            # The market buy already succeeded. A failure on one or more TP
-            # orders is a warning, not a failed re-entry; callers must persist
-            # the open position so a later wallet scan cannot buy it twice.
             if result.get("error"):
                 result["tp_warning"] = result["error"]
                 result["error"] = None
