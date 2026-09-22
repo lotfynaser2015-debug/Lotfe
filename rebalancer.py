@@ -14,7 +14,7 @@ REENTRY_RECOVER_PCT = 1.2
 # Minimum minutes after stop before auto re-entry is allowed (soft; enforced in bot if needed)
 REENTRY_COOLDOWN_HINT_MIN = 20
 # Trailing distance when ATR is unknown (percent)
-DEFAULT_TRAIL_PCT = 1.5
+DEFAULT_TRAIL_PCT = 1.8
 
 
 class Rebalancer:

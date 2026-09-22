@@ -1,15 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-Smart TP / SL levels based on coin behaviour (ATR + structure).
+Smart TP / SL levels based on coin behaviour (ATR + structure + floors).
 Lightweight: heavy OHLCV work runs only at creation or manual refresh.
+
+Design goals:
+- Adapt to each coin's volatility and trend
+- Never produce absurdly tight targets (floors) so pumps can develop
+- Keep SL reasonable vs TP1 for a usable R:R
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# ---- Absolute floors / ceilings (percent) so low-ATR hours don't kill trades ----
+FLOOR_TP1 = 2.5
+FLOOR_TP2 = 4.5
+FLOOR_TP3 = 7.5
+FLOOR_SL = 1.8
+
+CAP_TP1 = 10.0
+CAP_TP2 = 16.0
+CAP_TP3 = 25.0
+CAP_SL = 8.0
 
 
 @dataclass
@@ -50,7 +67,6 @@ def _sma(values: List[float], period: int) -> float:
 
 
 def _atr_from_ohlcv(candles: List[List[float]], period: int = 14) -> float:
-    """Classic ATR from OHLCV rows [ts, o, h, l, c, v]."""
     if not candles or len(candles) < period + 1:
         return 0.0
     trs: List[float] = []
@@ -63,6 +79,19 @@ def _atr_from_ohlcv(candles: List[List[float]], period: int = 14) -> float:
     if len(trs) < period:
         return sum(trs) / len(trs) if trs else 0.0
     return sum(trs[-period:]) / period
+
+
+def _recent_range_pct(candles: List[List[float]], entry: float, lookback: int = 40) -> float:
+    """Highest high - lowest low over recent bars as % of entry (pump room signal)."""
+    if not candles or entry <= 0:
+        return 0.0
+    window = candles[-lookback:] if len(candles) >= lookback else candles
+    highs = [float(c[2]) for c in window]
+    lows = [float(c[3]) for c in window]
+    if not highs or not lows:
+        return 0.0
+    span = max(highs) - min(lows)
+    return (span / entry) * 100.0
 
 
 def classify_volatility(atr_pct: float) -> str:
@@ -97,13 +126,13 @@ def compute_smart_levels(
     fallback_sl: float = 3.0,
 ) -> SmartLevels:
     """
-    Build adaptive targets from ATR + trend.
+    Smart adaptive targets:
 
-    Multipliers (relative to ATR %):
-      low vol   → tighter targets, tighter SL
-      medium    → balanced
-      high vol  → wider targets, wider SL (room for pumps)
-      strong up → stretch TP3 further
+    1) Start from ATR-based multiples (behaviour of the coin)
+    2) Apply trend stretch (up → wider runners, down → tighter)
+    3) Blend in recent range (if the coin already swings hard, give room)
+    4) Enforce floors so quiet hours don't produce 1% targets
+    5) Cap extremes so a crazy ATR doesn't set 40% targets
     """
     symbol = (symbol or "").upper()
     entry = float(entry or 0)
@@ -120,39 +149,65 @@ def compute_smart_levels(
     atr = _atr_from_ohlcv(candles, 14)
     closes = [float(c[4]) for c in candles] if candles else []
     atr_pct = (atr / entry) * 100.0 if atr > 0 else 0.0
+    range_pct = _recent_range_pct(candles, entry, 40)
     vol = classify_volatility(atr_pct) if atr_pct > 0 else "medium"
     trend = classify_trend(closes)
 
-    # Base multiples of ATR for targets / SL
-    if vol == "low":
-        m1, m2, m3, msl, trail = 1.0, 1.8, 2.8, 1.1, 0.9
-    elif vol == "high":
-        m1, m2, m3, msl, trail = 1.3, 2.4, 4.0, 1.5, 1.3
-    else:
-        m1, m2, m3, msl, trail = 1.1, 2.0, 3.3, 1.25, 1.1
-
-    if trend == "up":
-        m2 *= 1.1
-        m3 *= 1.25
-    elif trend == "down":
-        m1 *= 0.9
-        m2 *= 0.85
-        m3 *= 0.8
-        msl *= 0.95
-
     if atr_pct <= 0:
-        # Fallback to user defaults when not enough candle data
         tp1_pct, tp2_pct, tp3_pct, sl_pct = fallback_tp1, fallback_tp2, fallback_tp3, fallback_sl
+        trail = 1.1
         reason = "insufficient candles — used configured %"
     else:
-        tp1_pct = max(1.2, min(12.0, atr_pct * m1))
-        tp2_pct = max(tp1_pct + 0.8, min(18.0, atr_pct * m2))
-        tp3_pct = max(tp2_pct + 1.0, min(28.0, atr_pct * m3))
-        sl_pct = max(1.0, min(10.0, atr_pct * msl))
-        # Never let SL be wider than TP1 in a silly way for low-vol coins
-        if sl_pct > tp1_pct * 1.15:
-            sl_pct = tp1_pct * 1.05
-        reason = f"ATR={atr_pct:.2f}% vol={vol} trend={trend}"
+        # ATR multiples — wider than v1 so quiet coins still have room
+        if vol == "low":
+            m1, m2, m3, msl, trail = 1.6, 3.0, 5.0, 1.35, 1.0
+        elif vol == "high":
+            m1, m2, m3, msl, trail = 1.8, 3.5, 6.0, 1.6, 1.35
+        else:
+            m1, m2, m3, msl, trail = 1.7, 3.2, 5.5, 1.45, 1.15
+
+        if trend == "up":
+            m1 *= 1.05
+            m2 *= 1.15
+            m3 *= 1.30
+        elif trend == "down":
+            m1 *= 0.95
+            m2 *= 0.90
+            m3 *= 0.85
+            msl *= 0.95
+
+        # Raw ATR-based
+        raw_tp1 = atr_pct * m1
+        raw_tp2 = atr_pct * m2
+        raw_tp3 = atr_pct * m3
+        raw_sl = atr_pct * msl
+
+        # Blend a fraction of recent range into the runner (TP3) and TP2
+        # so coins that already moved in a wide band get more room for pumps
+        if range_pct > 0:
+            raw_tp2 = max(raw_tp2, range_pct * 0.35)
+            raw_tp3 = max(raw_tp3, range_pct * 0.55)
+
+        # Floors: never tighter than these (your main complaint)
+        tp1_pct = max(FLOOR_TP1, min(CAP_TP1, raw_tp1))
+        tp2_pct = max(FLOOR_TP2, min(CAP_TP2, raw_tp2))
+        tp3_pct = max(FLOOR_TP3, min(CAP_TP3, raw_tp3))
+        sl_pct = max(FLOOR_SL, min(CAP_SL, raw_sl))
+
+        # Keep ordering: TP1 < TP2 < TP3
+        if tp2_pct < tp1_pct + 1.2:
+            tp2_pct = tp1_pct + 1.5
+        if tp3_pct < tp2_pct + 1.5:
+            tp3_pct = tp2_pct + 2.0
+
+        # SL should stay meaningful but not wider than ~80% of TP1 (R:R bias)
+        if sl_pct > tp1_pct * 0.85:
+            sl_pct = max(FLOOR_SL, tp1_pct * 0.75)
+
+        reason = (
+            f"ATR={atr_pct:.2f}% range40={range_pct:.1f}% "
+            f"vol={vol} trend={trend}"
+        )
 
     tp1 = entry * (1 + tp1_pct / 100.0)
     tp2 = entry * (1 + tp2_pct / 100.0)
@@ -170,11 +225,11 @@ def compute_smart_levels(
         tp2_price=tp2,
         tp3_price=tp3,
         sl_price=sl,
-        tp1_pct=tp1_pct,
-        tp2_pct=tp2_pct,
-        tp3_pct=tp3_pct,
-        stop_loss_pct=sl_pct,
-        trail_atr_mult=trail,
+        tp1_pct=round(tp1_pct, 3),
+        tp2_pct=round(tp2_pct, 3),
+        tp3_pct=round(tp3_pct, 3),
+        stop_loss_pct=round(sl_pct, 3),
+        trail_atr_mult=trail if atr_pct > 0 else 1.1,
         reason=reason,
     )
 
@@ -183,12 +238,10 @@ def trailing_stop_price(
     current_price: float,
     current_sl: float,
     atr: float = 0.0,
-    trail_atr_mult: float = 1.1,
-    min_trail_pct: float = 1.2,
+    trail_atr_mult: float = 1.15,
+    min_trail_pct: float = 1.8,
 ) -> float:
-    """
-    Only moves SL upward. Prefer ATR distance; fall back to min_trail_pct.
-    """
+    """Only moves SL upward. Prefer ATR distance; fall back to min_trail_pct."""
     price = float(current_price or 0)
     sl = float(current_sl or 0)
     if price <= 0:
