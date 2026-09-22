@@ -3979,6 +3979,169 @@ async def experts_auto_job(context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
+# ---- Smart levels soft refresh (low API pressure) ----
+# coin_id -> last refresh unix time
+_smart_refresh_ts: dict = {}
+SMART_REFRESH_EVERY_SEC = 3 * 3600   # كل عملة مرة كل 3 ساعات كحد أقصى
+SMART_REFRESH_MAX_PER_RUN = 4        # أقصى 4 عملات في الدورة
+SMART_REFRESH_MIN_CHANGE_PCT = 0.8   # حدّث الأوامر فقط لو التغير أكبر من 0.8%
+
+
+async def smart_levels_refresh_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    تحديث خفيف للأهداف الذكية بدون ضغط API:
+    - كل دورة تعالج عدد صغير من العملات فقط
+    - كل عملة تتحدث مرة كل عدة ساعات
+    - OHLCV يُجلب فقط للعملات المختارة
+    - أوامر المنصة تتغير فقط لو الفرق معنوي
+    """
+    import asyncio
+    import time as _time
+
+    db = SessionLocal()
+    try:
+        positions = get_open_positions(db)
+        openish = [
+            c for c in positions
+            if (c.position_status or "") in ("open", "tp1_hit", "tp2_hit")
+        ]
+        if not openish:
+            return
+
+        now = _time.time()
+        due = []
+        for c in openish:
+            last = float(_smart_refresh_ts.get(c.id) or 0)
+            if now - last >= SMART_REFRESH_EVERY_SEC:
+                due.append(c)
+        # الأقدم أولاً
+        due.sort(key=lambda c: float(_smart_refresh_ts.get(c.id) or 0))
+        batch = due[:SMART_REFRESH_MAX_PER_RUN]
+        if not batch:
+            return
+
+        reb = get_reb()
+        loop = asyncio.get_event_loop()
+
+        for coin in batch:
+            try:
+                pf = coin.portfolio
+                if not pf or not pf.is_running:
+                    _smart_refresh_ts[coin.id] = now
+                    continue
+                tid = pf.telegram_id
+                user = get_or_create_user(db, tid)
+
+                def pct(pf_val, user_val, default):
+                    if pf_val is not None and float(pf_val) > 0:
+                        return float(pf_val)
+                    if user_val is not None and float(user_val) > 0:
+                        return float(user_val)
+                    return default
+
+                fb1 = pct(getattr(pf, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
+                fb2 = pct(getattr(pf, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
+                fb3 = pct(getattr(pf, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
+                fb_sl = pct(getattr(pf, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
+                s1 = pct(getattr(pf, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
+                s2 = pct(getattr(pf, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
+
+                entry = float(coin.entry_price or 0)
+                amount = float(coin.remaining_amount or coin.amount or 0)
+                if entry <= 0 or amount <= 0:
+                    _smart_refresh_ts[coin.id] = now
+                    continue
+
+                levels = await loop.run_in_executor(
+                    None,
+                    lambda: reb.build_smart_levels_for_entry(
+                        coin.symbol, entry, fb1, fb2, fb3, fb_sl, "1h",
+                    ),
+                )
+
+                old_tp1 = float(coin.tp1_price or 0)
+                new_tp1 = float(levels.tp1_price or 0)
+                # لو التغير صغير → متلمسش أوامر المنصة
+                changed = True
+                if old_tp1 > 0 and new_tp1 > 0:
+                    rel = abs(new_tp1 - old_tp1) / old_tp1 * 100.0
+                    if rel < SMART_REFRESH_MIN_CHANGE_PCT:
+                        changed = False
+
+                status = coin.position_status or "open"
+                if not changed:
+                    _smart_refresh_ts[coin.id] = now
+                    continue
+
+                # إلغاء وإعادة وضع للأهداف المتبقية فقط
+                await loop.run_in_executor(
+                    None,
+                    lambda: reb.cancel_tp_orders([{
+                        "symbol": coin.symbol,
+                        "tp_order_id": getattr(coin, "tp_order_id", None),
+                        "tp1_order_id": getattr(coin, "tp1_order_id", None),
+                        "tp2_order_id": getattr(coin, "tp2_order_id", None),
+                        "tp3_order_id": getattr(coin, "tp3_order_id", None),
+                    }]),
+                )
+                skipped = []
+                if status in ("tp1_hit", "tp2_hit", "tp3_hit"):
+                    skipped.append("tp1")
+                if status in ("tp2_hit", "tp3_hit"):
+                    skipped.append("tp2")
+                if status == "tp3_hit":
+                    skipped.append("tp3")
+
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: reb.place_tp_orders(
+                        [{"symbol": coin.symbol, "amount": amount, "entry_price": entry}],
+                        levels.tp1_pct, levels.tp2_pct, levels.tp3_pct, levels.stop_loss_pct,
+                        s1, s2, skip_stages=skipped,
+                    )[0],
+                )
+                if result.get("error"):
+                    logger.warning("smart refresh %s: %s", coin.symbol, result["error"])
+                    _smart_refresh_ts[coin.id] = now
+                    continue
+
+                # سياسة الاستوب حسب المرحلة (متغيرش حماية الربح)
+                if status == "open":
+                    new_sl = result.get("sl_price", coin.current_sl_price)
+                elif status == "tp1_hit":
+                    new_sl = entry
+                elif status == "tp2_hit":
+                    new_sl = float(result.get("tp1_price") or coin.tp1_price or entry)
+                    if new_sl < entry:
+                        new_sl = entry
+                else:
+                    new_sl = coin.current_sl_price
+
+                update_coin_position(
+                    db, coin.id,
+                    tp1_price=result.get("tp1_price", coin.tp1_price),
+                    tp2_price=result.get("tp2_price", coin.tp2_price),
+                    tp3_price=result.get("tp3_price", coin.tp3_price),
+                    current_sl_price=new_sl,
+                    tp1_order_id=result.get("tp1_order_id") if "tp1" not in skipped else None,
+                    tp2_order_id=result.get("tp2_order_id") if "tp2" not in skipped else None,
+                    tp3_order_id=result.get("tp3_order_id") if "tp3" not in skipped else None,
+                )
+                _smart_refresh_ts[coin.id] = now
+                logger.info(
+                    "smart refresh %s: TP1=%.2f%% TP2=%.2f%% TP3=%.2f%% (%s)",
+                    coin.symbol, levels.tp1_pct, levels.tp2_pct, levels.tp3_pct, levels.reason,
+                )
+                await asyncio.sleep(0.4)
+            except Exception:
+                logger.exception("smart_levels_refresh_job coin=%s", getattr(coin, "symbol", "?"))
+                _smart_refresh_ts[coin.id] = now
+    except Exception:
+        logger.exception("smart_levels_refresh_job error")
+    finally:
+        db.close()
+
+
 async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
     """Background job: check open positions for TP fill / SL hit / re-entry."""
     import asyncio
@@ -4328,6 +4491,14 @@ def main():
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 60},
         )
         logger.info("Experts auto job scheduled (check every 60s)")
+        # تحديث أهداف ذكي خفيف: كل 10 دقائق، أقصى 4 عملات، وكل عملة كل 3 ساعات
+        app.job_queue.run_repeating(
+            smart_levels_refresh_job,
+            interval=600,
+            first=90,
+            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 120},
+        )
+        logger.info("Smart levels soft-refresh scheduled (every 10min, max 4 coins/run)")
     else:
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
