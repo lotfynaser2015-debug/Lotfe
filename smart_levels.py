@@ -18,14 +18,14 @@ logger = logging.getLogger(__name__)
 
 
 # ---- Absolute floors / ceilings (percent) so low-ATR hours don't kill trades ----
-FLOOR_TP1 = 2.5
-FLOOR_TP2 = 4.5
-FLOOR_TP3 = 7.5
-FLOOR_SL = 1.8
+FLOOR_TP1 = 3.0
+FLOOR_TP2 = 6.0
+FLOOR_TP3 = 12.0
+FLOOR_SL = 2.0
 
-CAP_TP1 = 10.0
-CAP_TP2 = 16.0
-CAP_TP3 = 25.0
+CAP_TP1 = 12.0
+CAP_TP2 = 20.0
+CAP_TP3 = 35.0
 CAP_SL = 8.0
 
 

@@ -4237,6 +4237,36 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
+            elif act["action"] == "pump_mode":
+                new_sl = float(act.get("new_sl") or 0)
+                gain = float(act.get("gain_pct") or 0)
+                trail_pct = float(act.get("trail_pct") or 3.5)
+                kwargs = {
+                    "current_sl_price": new_sl if new_sl > 0 else coin.current_sl_price,
+                    "tp2_order_id": None,
+                    "tp3_order_id": None,
+                    "tp_order_id": None,
+                }
+                # من open: نلغي TP1 الثابت كمان ونحوّل لوضع runner
+                if (coin.position_status or "") == "open":
+                    kwargs["tp1_order_id"] = None
+                    kwargs["position_status"] = "tp2_hit"  # runner + trailing
+                elif (coin.position_status or "") == "tp1_hit":
+                    kwargs["position_status"] = "tp2_hit"
+                update_coin_position(db, coin.id, **kwargs)
+                msg = (
+                    f"🚀 *وضع بامب* — `{symbol}`\n"
+                    f"الربح الحالي: `+{gain:.1f}%`\n"
+                    f"تم إلغاء الأهداف الثابتة المتبقية\n"
+                    f"الاعتماد على Trailing `{trail_pct:.1f}%` عشان نركب الموجة\n"
+                    f"الاستوب: `{new_sl:.6g}`\n"
+                    f"المحفظة: *{pf.name if pf else '—'}*"
+                )
+                try:
+                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                except Exception:
+                    pass
+
             elif act["action"] == "trail_update":
                 new_sl = float(act.get("new_sl") or 0)
                 if new_sl <= 0:
@@ -4245,9 +4275,12 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 if new_sl <= old_sl:
                     continue
                 update_coin_position(db, coin.id, current_sl_price=new_sl)
+                pump_tag = " (بامب)" if act.get("pump") else ""
+                gain = act.get("gain_pct")
+                gain_txt = f"\nالربح: `+{float(gain):.1f}%`" if gain is not None else ""
                 msg = (
-                    f"📈 *Trailing* — `{symbol}`\n"
-                    f"السعر: `{act['price']:.6g}`\n"
+                    f"📈 *Trailing{pump_tag}* — `{symbol}`\n"
+                    f"السعر: `{act['price']:.6g}`{gain_txt}\n"
                     f"الاستوب الجديد: `{new_sl:.6g}`\n"
                     f"المحفظة: *{pf.name if pf else '—'}*"
                 )

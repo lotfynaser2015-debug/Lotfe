@@ -15,6 +15,11 @@ REENTRY_RECOVER_PCT = 1.2
 REENTRY_COOLDOWN_HINT_MIN = 20
 # Trailing distance when ATR is unknown (percent)
 DEFAULT_TRAIL_PCT = 1.8
+# Pump / strong-move detection (from entry, no extra API)
+PUMP_GAIN_PCT = 6.0          # ربح من الدخول ≥ 6% → وضع بامب
+PUMP_STRONG_GAIN_PCT = 12.0  # ربح ≥ 12% → Trailing أوسع
+PUMP_TRAIL_PCT = 3.5         # trail في وضع البامب
+PUMP_STRONG_TRAIL_PCT = 4.5  # trail في البامب القوي
 
 
 class Rebalancer:
@@ -422,10 +427,88 @@ class Rebalancer:
                 })
                 continue
 
-            # ----- trailing stop after TP2 (remaining runner) -----
-            if status == "tp2_hit":
+            # ----- Pump mode + trailing runner (لا تضيع البامبات) -----
+            # يعتمد على السعر الحالي مقابل الدخول فقط → بدون ضغط API إضافي
+            entry_px = float(coin.entry_price or 0)
+            gain_pct = ((price / entry_px) - 1.0) * 100.0 if entry_px > 0 else 0.0
+            in_pump = gain_pct >= PUMP_GAIN_PCT
+            strong_pump = gain_pct >= PUMP_STRONG_GAIN_PCT
+
+            if in_pump and status in ("open", "tp1_hit", "tp2_hit"):
+                # إلغاء أهداف البيع المحددة المتبقية عشان متتقفلش الصفقة بدري عند TP ثابت
+                has_open_tp = any([
+                    getattr(coin, "tp2_order_id", None) if status in ("open", "tp1_hit") else None,
+                    getattr(coin, "tp3_order_id", None),
+                    getattr(coin, "tp_order_id", None),
+                ])
+                # لو لسه open وما اتحققش TP1: نلغي TP2/TP3 ونسيب TP1 يتحقق جزئياً أو نلغي الكل ونعتمد runner
+                if has_open_tp or status in ("open", "tp1_hit"):
+                    cancelled_any = False
+                    for oid_key in ("tp2_order_id", "tp3_order_id", "tp_order_id"):
+                        # في وضع البامب: بعد ربح 6% نلغي TP2/TP3 دائماً؛ TP1 يبقى لو لسه open
+                        if status != "open" and oid_key == "tp1_order_id":
+                            continue
+                        oid = getattr(coin, oid_key, None)
+                        if oid:
+                            try:
+                                self.client.cancel_order(oid, symbol)
+                                cancelled_any = True
+                            except Exception:
+                                pass
+                    if status == "open":
+                        # بعد 6% ربح: كمان نلغي TP1 الثابت ونحوّل الباقي لـ runner
+                        oid1 = getattr(coin, "tp1_order_id", None)
+                        if oid1:
+                            try:
+                                self.client.cancel_order(oid1, symbol)
+                                cancelled_any = True
+                            except Exception:
+                                pass
+                    if cancelled_any:
+                        # حماية: استوب على الأقل عند الدخول أو أعلى
+                        protect = float(coin.current_sl_price or 0)
+                        if protect < entry_px:
+                            protect = entry_px
+                        trail_pct = PUMP_STRONG_TRAIL_PCT if strong_pump else PUMP_TRAIL_PCT
+                        trail_sl = trailing_stop_price(
+                            price, protect, atr=0.0, min_trail_pct=trail_pct,
+                        )
+                        actions.append({
+                            "coin_id": getattr(coin, "id", None),
+                            "symbol": symbol,
+                            "action": "pump_mode",
+                            "price": price,
+                            "gain_pct": gain_pct,
+                            "new_sl": max(protect, trail_sl),
+                            "trail_pct": trail_pct,
+                            "clear_tp_orders": True,
+                        })
+                        # استوب check later this cycle uses DB old SL; trail applies next updates
+
+                # Trailing أوسع طالما البامب شغال (حتى قبل/بعد TP)
                 sl_now = float(coin.current_sl_price or 0)
-                # Trail only while price is above protected level
+                # أرضية الحماية: دخول، وبعد TP2 مستوى الهدف 1
+                floor = entry_px
+                if status == "tp2_hit":
+                    floor = max(floor, float(coin.tp1_price or entry_px))
+                trail_pct = PUMP_STRONG_TRAIL_PCT if strong_pump else PUMP_TRAIL_PCT
+                new_trail = trailing_stop_price(
+                    price, max(sl_now, floor), atr=0.0, min_trail_pct=trail_pct,
+                )
+                if new_trail > sl_now * 1.002 and new_trail >= floor:
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "trail_update",
+                        "new_sl": new_trail,
+                        "price": price,
+                        "pump": True,
+                        "gain_pct": gain_pct,
+                    })
+
+            # ----- trailing stop after TP2 (normal, non-pump) -----
+            elif status == "tp2_hit":
+                sl_now = float(coin.current_sl_price or 0)
                 new_trail = trailing_stop_price(
                     price,
                     sl_now,
@@ -433,7 +516,6 @@ class Rebalancer:
                     trail_atr_mult=1.1,
                     min_trail_pct=DEFAULT_TRAIL_PCT,
                 )
-                # Only emit when meaningfully higher (avoid spam from noise)
                 if new_trail > sl_now * 1.0015:
                     actions.append({
                         "coin_id": getattr(coin, "id", None),
@@ -442,7 +524,6 @@ class Rebalancer:
                         "new_sl": new_trail,
                         "price": price,
                     })
-                    # do not continue — still allow SL check below with old sl this cycle
 
             # ----- stop loss -----
             sl = float(coin.current_sl_price or 0)
