@@ -35,6 +35,19 @@ from database import (
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
 from decision_engine import get_engine
+from auto_system import (
+    portfolio_specs,
+    format_coins_message,
+    set_system_enabled,
+    is_system_enabled,
+    detect_market_regime,
+    should_allow_entry,
+    daily_loss_triggered,
+    should_alert_defense,
+    AUTO_PORTFOLIO_NAMES,
+    PORTFOLIO_CORE_NAME,
+    PORTFOLIO_GROWTH_NAME,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -84,6 +97,11 @@ async def ensure_admin(update: Update) -> bool:
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶️ تشغيل النظام", callback_data="auto_sys_start"),
+            InlineKeyboardButton("⏹ إيقاف النظام", callback_data="auto_sys_stop"),
+        ],
+        [InlineKeyboardButton("📡 حالة الإدارة / السوق", callback_data="auto_sys_status")],
         [
             InlineKeyboardButton("📋 محافظي", callback_data="list_pf"),
             InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf"),
@@ -1545,6 +1563,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard(),
         )
+        return
+
+    if data == "auto_sys_status":
+        try:
+            reg = detect_market_regime(get_mexc())
+            status = "🟢 شغال" if is_system_enabled(tid) else "⚪ متوقف"
+            text = (
+                f"{format_coins_message()}\n\n"
+                f"حالة النظام: *{status}*\n"
+                f"{reg.message}"
+            )
+        except Exception as e:
+            text = f"{format_coins_message()}\n\n⚠️ تقييم السوق: `{e}`"
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    if data == "auto_sys_start":
+        await _auto_system_start(query, tid)
+        return
+
+    if data == "auto_sys_stop":
+        await _auto_system_stop(query, tid)
         return
 
     if data == "list_pf":
@@ -3979,12 +4021,243 @@ async def experts_auto_job(context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
+async def _auto_system_start(query, tid: int):
+    """تفعيل الإدارة الذكية على محافظ المستخدم بعد إنشائها يدوياً."""
+    db = SessionLocal()
+    try:
+        set_system_enabled(tid, True)
+        pfs = get_portfolios(db, tid, status="active")
+        if not pfs:
+            await query.edit_message_text(
+                "📭 *لا توجد محافظ بعد*\n\n"
+                "1) أنشئ محفظة من *➕ محفظة جديدة*\n"
+                "2) اختر العملات والمبلغ\n"
+                "3) اضغط *▶️ تشغيل النظام*\n\n"
+                "بعدها البوت يتولى الأهداف / البامب / الدفاع.",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        started = []
+        for p in pfs:
+            if not p.is_running:
+                set_portfolio_running(db, p.id, True)
+                started.append(p.name)
+            else:
+                started.append(f"{p.name} (كانت شغالة)")
+
+        reg = detect_market_regime(get_mexc())
+        lines_msg = [
+            "✅ *تم تشغيل الإدارة الذكية*",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"المحافظ تحت الإدارة: *{len(pfs)}*",
+        ]
+        lines_msg += [f"• `{n}`" for n in started]
+        lines_msg += [
+            "",
+            reg.message,
+            "",
+            "البوت الآن على محافظك:",
+            "• أهداف ذكية + وضع البامب",
+            "• Trailing ومتابعة الصعود",
+            "• حسّ السوق من BTC",
+            "• حماية أرباح عند الضعف",
+            "• خروج دفاعي عند الانهيار",
+            "",
+            "لو لسه ما اشتريتش: *♻️ إعادة بناء المراكز* داخل كل محفظة.",
+        ]
+        await query.edit_message_text(
+            "\n".join(lines_msg),
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as e:
+        logger.exception("auto_sys_start")
+        await query.edit_message_text(
+            f"❌ فشل تشغيل النظام:\n`{e}`",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+    finally:
+        db.close()
+
+
+async def _auto_system_stop(query, tid: int):
+    db = SessionLocal()
+    try:
+        set_system_enabled(tid, False)
+        msg = (
+            "⏹ *تم إيقاف الإدارة الذكية*\n"
+            "• حسّ السوق / الخروج الدفاعي: متوقف\n"
+            "• المراكز المفتوحة تفضل تحت مراقبة الأهداف والاستوب\n"
+            "• تقدر توقف أي محفظة يدوياً من داخلها"
+        )
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    except Exception as e:
+        await query.edit_message_text(f"خطأ: `{e}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    finally:
+        db.close()
+
+
 # ---- Smart levels soft refresh (low API pressure) ----
 # coin_id -> last refresh unix time
 _smart_refresh_ts: dict = {}
 SMART_REFRESH_EVERY_SEC = 3 * 3600   # كل عملة مرة كل 3 ساعات كحد أقصى
 SMART_REFRESH_MAX_PER_RUN = 4        # أقصى 4 عملات في الدورة
 SMART_REFRESH_MIN_CHANGE_PCT = 0.8   # حدّث الأوامر فقط لو التغير أكبر من 0.8%
+
+
+async def market_sense_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    يحس بالسوق كل دقيقتين:
+    - weak: يمنع دخول + يرفع استوب الصفقات الرابحة لـ break-even
+    - black/crash: خروج دفاعي (بيع المراكز في المحافظ التلقائية)
+    - حد خسارة يومي من قمة اليوم
+    """
+    import asyncio
+    db = SessionLocal()
+    try:
+        client = get_mexc()
+        reg = detect_market_regime(client)
+        positions = get_open_positions(db)
+        if not positions and reg.defense_level == 0:
+            return
+
+        # تجميع حسب المستخدم
+        by_user: Dict[int, list] = {}
+        for coin in positions:
+            pf = coin.portfolio
+            if not pf or not pf.is_running:
+                continue
+            by_user.setdefault(int(pf.telegram_id), []).append(coin)
+
+        # مستخدمون مفعّل عندهم النظام حتى بدون مراكز (لتنبيه فقط)
+        # نمر على by_user + أي tid شغال من الذاكرة عبر المراكز فقط لتبسيط
+
+        for tid, coins in by_user.items():
+            if not is_system_enabled(tid):
+                continue
+
+            # قيمة تقريبية للمراكز المفتوحة
+            symbols = list({c.symbol for c in coins})
+            prices = {}
+            try:
+                prices = client.get_all_prices(symbols) or {}
+            except Exception:
+                prices = {}
+
+            equity = 0.0
+            for c in coins:
+                px = float(prices.get(c.symbol) or prices.get(f"{c.symbol}/USDT") or 0)
+                if px <= 0:
+                    try:
+                        px = float(client.get_ticker_price(f"{c.symbol}/{client.quote}") or 0)
+                    except Exception:
+                        px = 0
+                amt = float(c.remaining_amount or c.amount or 0)
+                equity += amt * px
+
+            loss_hit, loss_msg = daily_loss_triggered(tid, equity)
+            defense = reg.defense_level
+            if loss_hit:
+                defense = max(defense, 2)
+
+            if defense <= 0:
+                continue
+            if not should_alert_defense(tid, 600):
+                # حتى لو مننبعتش رسالة، في الانهيار ننفذ الخروج
+                if defense < 2:
+                    continue
+
+            reb = get_reb()
+            loop = asyncio.get_event_loop()
+            protected = 0
+            exited = 0
+
+            if defense == 1:
+                # حماية: الاستوب → الدخول للصفقات الرابحة
+                for c in coins:
+                    entry = float(c.entry_price or 0)
+                    px = float(prices.get(c.symbol) or 0)
+                    if entry <= 0 or px <= 0:
+                        continue
+                    if px > entry * 1.005:
+                        cur_sl = float(c.current_sl_price or 0)
+                        if cur_sl < entry:
+                            update_coin_position(db, c.id, current_sl_price=entry)
+                            protected += 1
+                if should_alert_defense(tid, 1):  # already gated above mostly
+                    msg = (
+                        f"🛡️ *دفاع السوق*\n{reg.message}\n"
+                        f"{loss_msg}\n"
+                        f"تم رفع استوب *{protected}* صفقة رابحة لسعر الدخول.\n"
+                        f"دخول جديد: ❌ متوقف"
+                    )
+                    try:
+                        await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                    except Exception:
+                        pass
+
+            if defense >= 2:
+                # خروج طارئ من المحافظ التلقائية
+                for c in coins:
+                    symbol = c.symbol
+                    try:
+                        await loop.run_in_executor(
+                            None,
+                            lambda s=symbol, coin=c: reb.cancel_tp_orders([{
+                                "symbol": s,
+                                "tp_order_id": getattr(coin, "tp_order_id", None),
+                                "tp1_order_id": getattr(coin, "tp1_order_id", None),
+                                "tp2_order_id": getattr(coin, "tp2_order_id", None),
+                                "tp3_order_id": getattr(coin, "tp3_order_id", None),
+                            }]),
+                        )
+                        amount = await loop.run_in_executor(
+                            None, lambda s=symbol: client.get_free_amount(s) * 0.998
+                        )
+                        if amount > 0:
+                            await loop.run_in_executor(
+                                None,
+                                lambda s=symbol, a=amount: client.create_market_order(
+                                    f"{s}/{client.quote}", "sell", a
+                                ),
+                            )
+                        entry = float(c.entry_price or 0)
+                        px = float(prices.get(symbol) or entry)
+                        amt = float(c.remaining_amount or c.amount or 0)
+                        pnl = (px - entry) * amt if entry else 0
+                        record_trade_event(
+                            db, tid, c.portfolio_id, c.id, symbol, "defense_exit",
+                            entry, px, amt, pnl, details=reg.message,
+                        )
+                        update_coin_position(
+                            db, c.id,
+                            position_status="closed",
+                            current_sl_price=0.0,
+                            remaining_amount=0.0,
+                            amount=0.0,
+                            tp1_order_id=None, tp2_order_id=None, tp3_order_id=None,
+                            tp_order_id=None,
+                        )
+                        exited += 1
+                    except Exception:
+                        logger.exception("defense exit %s", symbol)
+                msg = (
+                    f"🔴 *خروج دفاعي — انهيار/سواد*\n{reg.message}\n"
+                    f"{loss_msg}\n"
+                    f"تم إغلاق *{exited}* مركز في المحافظ التلقائية.\n"
+                    f"الدخول الجديد متوقف حتى يتحسن السوق."
+                )
+                try:
+                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("market_sense_job error")
+    finally:
+        db.close()
 
 
 async def smart_levels_refresh_job(context: ContextTypes.DEFAULT_TYPE):
@@ -4532,6 +4805,13 @@ def main():
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 120},
         )
         logger.info("Smart levels soft-refresh scheduled (every 10min, max 4 coins/run)")
+        app.job_queue.run_repeating(
+            market_sense_job,
+            interval=120,
+            first=40,
+            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 60},
+        )
+        logger.info("Market sense / defense job scheduled (every 2min)")
     else:
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
