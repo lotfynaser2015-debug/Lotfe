@@ -20,6 +20,8 @@ PUMP_GAIN_PCT = 6.0          # ربح من الدخول ≥ 6% → وضع بام
 PUMP_STRONG_GAIN_PCT = 12.0  # ربح ≥ 12% → Trailing أوسع
 PUMP_TRAIL_PCT = 3.5         # trail في وضع البامب
 PUMP_STRONG_TRAIL_PCT = 4.5  # trail في البامب القوي
+# أقل من 8$ → هدف واحد فقط؛ 8$ فأكثر → تقسيم 3 أهداف
+SMALL_TRADE_USDT = 8.0
 
 
 class Rebalancer:
@@ -207,13 +209,29 @@ class Rebalancer:
             tp3 = entry * (1 + tp3_pct / 100.0)
             sl = entry * (1 - stop_loss_pct / 100.0)
 
+            position_usdt = amount * entry
+            small_trade = position_usdt < SMALL_TRADE_USDT
+
             orders = {"tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None}
             errors = []
-            planned = [
-                ("tp1", "tp1_order_id", tp1, max(0.0, tp1_sell_pct)),
-                ("tp2", "tp2_order_id", tp2, max(0.0, tp2_sell_pct)),
-                ("tp3", "tp3_order_id", tp3, max(0.0, 100.0 - tp1_sell_pct - tp2_sell_pct)),
-            ]
+            if small_trade:
+                # أقل من 8$: هدف واحد فقط (عند TP2 تقريباً) + الباقي يُدار بالـ trailing/الاستوب
+                # تجنب تقطيع 5$ لشرائح تفشل على حد المنصة
+                single_pct = max(tp1_pct, min(tp2_pct, (tp1_pct + tp2_pct) / 2.0))
+                single_price = entry * (1 + single_pct / 100.0)
+                # نخزّن المستويات للمرجع حتى لو أمر واحد
+                tp1 = single_price
+                tp2 = entry * (1 + max(tp2_pct, single_pct + 2) / 100.0)
+                tp3 = entry * (1 + max(tp3_pct, single_pct + 5) / 100.0)
+                planned = [
+                    ("tp1", "tp1_order_id", single_price, 100.0),
+                ]
+            else:
+                planned = [
+                    ("tp1", "tp1_order_id", tp1, max(0.0, tp1_sell_pct)),
+                    ("tp2", "tp2_order_id", tp2, max(0.0, tp2_sell_pct)),
+                    ("tp3", "tp3_order_id", tp3, max(0.0, 100.0 - tp1_sell_pct - tp2_sell_pct)),
+                ]
             active = [stage for stage in planned if stage[0] not in skipped and stage[3] > 0]
             # فلترة الشرائح اللي قيمتها أقل من 1 USDT ودمج وزنها في آخر شريحة صالحة
             MIN_NOTIONAL = 1.05  # هامش فوق حد MEXC (1 USDT)
