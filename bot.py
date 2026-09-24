@@ -98,14 +98,10 @@ async def ensure_admin(update: Update) -> bool:
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("▶️ تشغيل النظام", callback_data="auto_sys_start"),
-            InlineKeyboardButton("⏹ إيقاف النظام", callback_data="auto_sys_stop"),
-        ],
-        [InlineKeyboardButton("📡 حالة الإدارة / السوق", callback_data="auto_sys_status")],
-        [
             InlineKeyboardButton("📋 محافظي", callback_data="list_pf"),
             InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf"),
         ],
+        [InlineKeyboardButton("📡 حالة السوق", callback_data="auto_sys_status")],
         [InlineKeyboardButton("🧠 تحليل الخبراء", callback_data="experts")],
         [
             InlineKeyboardButton("📡 مصادر الإشارات", callback_data="list_sources"),
@@ -1568,25 +1564,44 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "auto_sys_status":
         try:
             reg = detect_market_regime(get_mexc())
-            status = "🟢 شغال" if is_system_enabled(tid) else "⚪ متوقف"
+            db = SessionLocal()
+            try:
+                pfs = get_portfolios(db, tid, status="active")
+                if pfs:
+                    pf_lines = "\n".join(
+                        f"{'🟢 إدارة شغالة' if p.is_running else '⚪ متوقفة'} — `{p.name}`"
+                        for p in pfs
+                    )
+                else:
+                    pf_lines = "_لا محافظ — أنشئ ثم شغّل من داخل المحفظة_"
+            finally:
+                db.close()
             text = (
-                f"{format_coins_message()}\n\n"
-                f"حالة النظام: *{status}*\n"
-                f"{reg.message}"
+                f"📡 *حالة السوق*\n{reg.message}\n\n"
+                f"*محافظك:*\n{pf_lines}\n\n"
+                f"شغّل المحفظة من داخلها ← الإدارة الذكية تشتغل على المحفظة دي فقط."
             )
         except Exception as e:
-            text = f"{format_coins_message()}\n\n⚠️ تقييم السوق: `{e}`"
+            text = f"⚠️ `{e}`"
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
         )
         return
 
     if data == "auto_sys_start":
-        await _auto_system_start(query, tid)
+        await query.edit_message_text(
+            "الإدارة *لكل محفظة لوحدها*.\nافتح المحفظة → *▶️ تشغيل المحفظة*.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     if data == "auto_sys_stop":
-        await _auto_system_stop(query, tid)
+        await query.edit_message_text(
+            "لإيقاف الإدارة: داخل المحفظة → *⏹ إيقاف المحفظة*.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     if data == "list_pf":
@@ -4136,8 +4151,7 @@ async def market_sense_job(context: ContextTypes.DEFAULT_TYPE):
         # نمر على by_user + أي tid شغال من الذاكرة عبر المراكز فقط لتبسيط
 
         for tid, coins in by_user.items():
-            if not is_system_enabled(tid):
-                continue
+            # الإدارة لكل محفظة شغالة (is_running) بدون نظام عام
 
             # قيمة تقريبية للمراكز المفتوحة
             symbols = list({c.symbol for c in coins})
