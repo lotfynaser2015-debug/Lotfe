@@ -30,12 +30,6 @@ class UserSettings(Base):
     stop_loss_pct = Column(Float, default=3.0)
     # legacy single field kept for migration compatibility
     take_profit_pct = Column(Float, default=5.0)
-    # نظام الخبراء — تنفيذ تلقائي أثناء النوم
-    experts_auto_execute = Column(Boolean, default=False)
-    experts_auto_timeframe = Column(String(10), default="1h")
-    experts_auto_interval_min = Column(Integer, default=60)  # كل كام دقيقة
-    experts_auto_portfolios = Column(String(200), default="")  # مثال: 30,34
-    experts_auto_last_run = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -63,13 +57,6 @@ class Portfolio(Base):
     tp1_sell_pct = Column(Float, nullable=True)
     tp2_sell_pct = Column(Float, nullable=True)
     stop_loss_pct = Column(Float, nullable=True)
-
-    # نظام الخبراء داخل المحفظة
-    experts_enabled = Column(Boolean, default=False)
-    experts_timeframe = Column(String(10), default="1h")
-    experts_last_action = Column(String(10), nullable=True)
-    experts_last_at = Column(DateTime, nullable=True)
-    experts_last_summary = Column(String(500), nullable=True)
 
     last_rebalance = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -143,49 +130,6 @@ class RebalanceLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-# ==================== SIGNAL ENGINE ====================
-
-class SignalSource(Base):
-    """مصدر إشارة (BlackRock, MacroStrategy, ...)"""
-    __tablename__ = "signal_sources"
-
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, index=True, nullable=False)
-    name = Column(String(80), nullable=False)
-    enabled = Column(Boolean, default=True)
-    min_usd = Column(Float, default=15_000_000)
-    max_tx_count = Column(Integer, default=3)
-    allow_buy = Column(Boolean, default=True)
-    allow_sell = Column(Boolean, default=True)
-    size_mode = Column(String(20), default="full")
-    size_value = Column(Float, default=100.0)
-    cooldown_minutes = Column(Integer, default=30)
-    notes = Column(String(300), default="")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    buy_portfolio_ids = Column(String(200), default="")
-    sell_portfolio_ids = Column(String(200), default="")
-
-    signals = relationship("SignalLog", back_populates="source", cascade="all, delete-orphan")
-
-
-class SignalLog(Base):
-    """سجل كل إشارة وصلت"""
-    __tablename__ = "signal_logs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    source_id = Column(Integer, ForeignKey("signal_sources.id"), nullable=True)
-    telegram_id = Column(BigInteger, index=True, nullable=False)
-    raw_text = Column(Text, nullable=True)
-    action = Column(String(10), nullable=False)
-    reason = Column(String(400), default="")
-    executed = Column(Boolean, default=False)
-    result_msg = Column(String(500), default="")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    source = relationship("SignalSource", back_populates="signals")
-
-
 def init_db():
     Base.metadata.create_all(bind=engine)
 
@@ -216,15 +160,6 @@ def init_db():
             for col in ("tp1_pct", "tp2_pct", "tp3_pct", "tp1_sell_pct", "tp2_sell_pct", "stop_loss_pct"):
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE portfolios ADD COLUMN {col} DOUBLE PRECISION"))
-            for col, typ in [
-                ("experts_enabled", "BOOLEAN DEFAULT FALSE"),
-                ("experts_timeframe", "VARCHAR(10) DEFAULT '1h'"),
-                ("experts_last_action", "VARCHAR(10)"),
-                ("experts_last_at", "TIMESTAMP"),
-                ("experts_last_summary", "VARCHAR(500)"),
-            ]:
-                if col not in cols:
-                    conn.execute(text(f"ALTER TABLE portfolios ADD COLUMN {col} {typ}"))
 
         if "portfolio_coins" in insp.get_table_names():
             cols = [c["name"] for c in insp.get_columns("portfolio_coins")]
@@ -265,15 +200,6 @@ def init_db():
             ]:
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE user_settings ADD COLUMN {col} DOUBLE PRECISION DEFAULT {default}"))
-            for col, typ in [
-                ("experts_auto_execute", "BOOLEAN DEFAULT FALSE"),
-                ("experts_auto_timeframe", "VARCHAR(10) DEFAULT '1h'"),
-                ("experts_auto_interval_min", "INTEGER DEFAULT 60"),
-                ("experts_auto_portfolios", "VARCHAR(200) DEFAULT ''"),
-                ("experts_auto_last_run", "TIMESTAMP"),
-            ]:
-                if col not in cols:
-                    conn.execute(text(f"ALTER TABLE user_settings ADD COLUMN {col} {typ}"))
             try:
                 conn.execute(text("UPDATE user_settings SET max_coins_per_portfolio = 30 WHERE max_coins_per_portfolio < 30 OR max_coins_per_portfolio IS NULL"))
             except Exception:
@@ -584,70 +510,3 @@ def log_action(db, telegram_id: int, action: str, details: str, success: bool = 
     )
     db.add(log)
     db.commit()
-
-
-# -------------------- Signal helpers --------------------
-
-def get_signal_sources(db, telegram_id: int):
-    return db.query(SignalSource).filter(SignalSource.telegram_id == telegram_id).order_by(SignalSource.id).all()
-
-
-def get_signal_source(db, source_id: int, telegram_id: int = None):
-    q = db.query(SignalSource).filter(SignalSource.id == source_id)
-    if telegram_id:
-        q = q.filter(SignalSource.telegram_id == telegram_id)
-    return q.first()
-
-
-def create_signal_source(db, telegram_id: int, name: str, **kwargs) -> SignalSource:
-    src = SignalSource(telegram_id=telegram_id, name=name.strip(), **kwargs)
-    db.add(src)
-    db.commit()
-    db.refresh(src)
-    return src
-
-
-def update_signal_source(db, source_id: int, **kwargs):
-    src = db.query(SignalSource).filter(SignalSource.id == source_id).first()
-    if not src:
-        return None
-    for k, v in kwargs.items():
-        if hasattr(src, k):
-            setattr(src, k, v)
-    src.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(src)
-    return src
-
-
-def delete_signal_source(db, source_id: int, telegram_id: int):
-    src = get_signal_source(db, source_id, telegram_id)
-    if src:
-        db.delete(src)
-        db.commit()
-        return True
-    return False
-
-
-def log_signal(db, telegram_id: int, action: str, reason: str = "", raw_text: str = "",
-               source_id: int = None, executed: bool = False, result_msg: str = ""):
-    entry = SignalLog(
-        telegram_id=telegram_id,
-        source_id=source_id,
-        action=action.upper(),
-        reason=reason[:400],
-        raw_text=raw_text[:2000] if raw_text else None,
-        executed=executed,
-        result_msg=result_msg[:500],
-    )
-    db.add(entry)
-    db.commit()
-    return entry
-
-
-def parse_portfolio_ids(ids_str: str) -> list:
-    """يقبل: 21,22  أو  #21,#22  أو  21#,22#"""
-    if not ids_str:
-        return []
-    import re
-    return [int(x) for x in re.findall(r"\d+", ids_str)]

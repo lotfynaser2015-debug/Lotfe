@@ -20,8 +20,8 @@ PUMP_GAIN_PCT = 6.0          # ربح من الدخول ≥ 6% → وضع بام
 PUMP_STRONG_GAIN_PCT = 12.0  # ربح ≥ 12% → Trailing أوسع
 PUMP_TRAIL_PCT = 3.5         # trail في وضع البامب
 PUMP_STRONG_TRAIL_PCT = 4.5  # trail في البامب القوي
-# أقل من 8$ → هدف واحد فقط؛ 8$ فأكثر → تقسيم 3 أهداف
-SMALL_TRADE_USDT = 8.0
+# أقل من 10$ → هدف واحد فقط (TP1 بنسبة 100%)؛ 10$ فأكثر → تقسيم 3 أهداف
+SMALL_TRADE_USDT = 10.0
 
 
 class Rebalancer:
@@ -383,6 +383,26 @@ class Rebalancer:
             if price <= 0:
                 continue
 
+            # لو مفيش رصيد فعلي والمكان مش waiting_reentry → اقفل المركز صامت
+            if status not in ("waiting_reentry",):
+                try:
+                    free_now = float(self.client.get_free_amount(symbol) or 0)
+                    total_now = float(self.client.get_total_amount(symbol) or 0)
+                except Exception:
+                    free_now = total_now = -1.0
+                rem = float(getattr(coin, "remaining_amount", None) or getattr(coin, "amount", None) or 0)
+                if free_now >= 0 and total_now >= 0 and free_now < 0.001 and total_now < 0.001 and rem > 0:
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "tp_full_close",
+                        "price": price,
+                        "filled_amount": rem,
+                        "fill_price": price,
+                        "stage": "balance_zero",
+                    })
+                    continue
+
             # ----- waiting for auto re-entry (simple) -----
             # Trigger when price recovers REENTRY_RECOVER_PCT above the stored level.
             if status == "waiting_reentry":
@@ -402,46 +422,89 @@ class Rebalancer:
                 continue
 
             # ----- normal TP detection -----
+            # لو الكمية المتبقية صغيرة جدًا أو الرصيد الفعلي = dust → إغلاق كامل
+            remaining_db = float(getattr(coin, "remaining_amount", None) or getattr(coin, "amount", None) or 0)
+            actual_free = 0.0
+            try:
+                actual_free = float(self.client.get_free_amount(symbol) or 0)
+            except Exception:
+                actual_free = remaining_db
+
+            def _is_full_fill(filled: float) -> bool:
+                if remaining_db <= 0:
+                    return True
+                if filled >= remaining_db * 0.92:
+                    return True
+                if actual_free < max(0.001, remaining_db * 0.05):
+                    return True
+                return False
+
             tp1_fill = self._filled_order_info(getattr(coin, "tp1_order_id", None), symbol)
             if status == "open" and tp1_fill:
-                actions.append({
-                    "coin_id": getattr(coin, "id", None),
-                    "symbol": symbol,
-                    "action": "tp1_hit",
-                    # TP1 → break-even (entry)
-                    "new_sl": float(coin.entry_price or 0),
-                    "price": price,
-                    "filled_amount": tp1_fill.get("filled", 0.0),
-                    "fill_price": tp1_fill.get("average") or coin.tp1_price,
-                })
+                filled = float(tp1_fill.get("filled") or 0)
+                fill_px = tp1_fill.get("average") or coin.tp1_price
+                if _is_full_fill(filled):
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "tp_full_close",
+                        "price": price,
+                        "filled_amount": filled or remaining_db,
+                        "fill_price": fill_px,
+                        "stage": "tp1",
+                    })
+                else:
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "tp1_hit",
+                        "new_sl": float(coin.entry_price or 0),
+                        "price": price,
+                        "filled_amount": filled,
+                        "fill_price": fill_px,
+                    })
                 continue
             tp2_fill = self._filled_order_info(getattr(coin, "tp2_order_id", None), symbol)
             if status in ("open", "tp1_hit") and tp2_fill:
-                # After TP2: protect profit by moving SL to TP1 (not to TP2 itself).
-                # This avoids the "raise SL to TP2 → instant stop-out" bug.
-                protect = float(coin.tp1_price or 0) or float(coin.entry_price or 0)
-                entry = float(coin.entry_price or 0)
-                if protect < entry:
-                    protect = entry
-                actions.append({
-                    "coin_id": getattr(coin, "id", None),
-                    "symbol": symbol,
-                    "action": "tp2_hit",
-                    "new_sl": protect,
-                    "price": price,
-                    "filled_amount": tp2_fill.get("filled", 0.0),
-                    "fill_price": tp2_fill.get("average") or coin.tp2_price,
-                })
+                filled = float(tp2_fill.get("filled") or 0)
+                fill_px = tp2_fill.get("average") or coin.tp2_price
+                if _is_full_fill(filled):
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "tp_full_close",
+                        "price": price,
+                        "filled_amount": filled or remaining_db,
+                        "fill_price": fill_px,
+                        "stage": "tp2",
+                    })
+                else:
+                    protect = float(coin.tp1_price or 0) or float(coin.entry_price or 0)
+                    entry = float(coin.entry_price or 0)
+                    if protect < entry:
+                        protect = entry
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "tp2_hit",
+                        "new_sl": protect,
+                        "price": price,
+                        "filled_amount": filled,
+                        "fill_price": fill_px,
+                    })
                 continue
             tp3_fill = self._filled_order_info(getattr(coin, "tp3_order_id", None), symbol)
             if status in ("open", "tp1_hit", "tp2_hit") and tp3_fill:
+                filled = float(tp3_fill.get("filled") or 0)
+                fill_px = tp3_fill.get("average") or coin.tp3_price
                 actions.append({
                     "coin_id": getattr(coin, "id", None),
                     "symbol": symbol,
-                    "action": "tp3_hit",
+                    "action": "tp_full_close" if _is_full_fill(filled) else "tp3_hit",
                     "price": price,
-                    "filled_amount": tp3_fill.get("filled", 0.0),
-                    "fill_price": tp3_fill.get("average") or coin.tp3_price,
+                    "filled_amount": filled or remaining_db,
+                    "fill_price": fill_px,
+                    "stage": "tp3",
                 })
                 continue
 

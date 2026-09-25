@@ -1,6 +1,6 @@
 """
-    MEXC Portfolio Manager + Signal Engine
-    بوت تليجرام لإدارة محافظ متعددة + نظام إشارات تنفيذ ذكي.
+    MEXC Portfolio Manager
+    بوت تليجرام لإدارة محافظ متعددة على MEXC Spot مع أهداف ذكية وTrailing.
 """
 import logging
 import re
@@ -26,15 +26,12 @@ from database import (
     delete_orphaned_portfolio_records,
     set_portfolio_running, log_action,
     Portfolio, PortfolioCoin, PortfolioTrade, RebalanceLog, UserSettings,
-    get_signal_sources, get_signal_source, create_signal_source,
-    update_signal_source, delete_signal_source, log_signal, parse_portfolio_ids,
-    SignalLog, update_coin_position, reset_coin_positions, get_open_positions,
+    update_coin_position, reset_coin_positions, get_open_positions,
     record_trade_event, get_trade_event, get_reentry_candidates,
     get_portfolio_trade_events, mark_reentry_events_used,
 )
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
-from decision_engine import get_engine
 from auto_system import (
     portfolio_specs,
     format_coins_message,
@@ -57,9 +54,7 @@ logger = logging.getLogger(__name__)
 
 (
     CREATE_NAME, CREATE_AMOUNT, CREATE_COINS, ADD_COIN, INCREASE_AMOUNT,
-    SRC_NAME, SRC_MIN_USD, SRC_MAX_TX, SRC_BUY_PFS, SRC_SELL_PFS,
-    EDIT_SRC_FIELD, EDIT_SRC_VALUE,
-) = range(12)
+) = range(5)
 
 _mexc: Optional[MexcClient] = None
 _reb: Optional[Rebalancer] = None
@@ -102,11 +97,7 @@ def main_menu_keyboard():
             InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf"),
         ],
         [InlineKeyboardButton("📡 حالة السوق", callback_data="auto_sys_status")],
-        [InlineKeyboardButton("🧠 تحليل الخبراء", callback_data="experts")],
-        [
-            InlineKeyboardButton("📡 مصادر الإشارات", callback_data="list_sources"),
-            InlineKeyboardButton("💰 الرصيد", callback_data="balance"),
-        ],
+        [InlineKeyboardButton("💰 الرصيد", callback_data="balance")],
         [
             InlineKeyboardButton("🧹 تنظيف القاعدة", callback_data="cleanup_db"),
             InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings"),
@@ -114,435 +105,31 @@ def main_menu_keyboard():
     ])
 
 
-def experts_timeframe_keyboard():
-    return InlineKeyboardMarkup([
+def pf_keyboard(pf_id: int, is_running: bool):
+    rows = [
         [
-            InlineKeyboardButton("15 دقيقة", callback_data="experts_tf_15m"),
-            InlineKeyboardButton("ساعة", callback_data="experts_tf_1h"),
+            InlineKeyboardButton("▶️ تشغيل" if not is_running else "⏹ إيقاف", callback_data=f"toggle_{pf_id}"),
+            InlineKeyboardButton("📊 تفاصيل", callback_data=f"view_{pf_id}"),
         ],
         [
-            InlineKeyboardButton("4 ساعات", callback_data="experts_tf_4h"),
-            InlineKeyboardButton("يومي", callback_data="experts_tf_1d"),
-            InlineKeyboardButton("أسبوعي", callback_data="experts_tf_1w"),
+            InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
+            InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
         ],
-        [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="menu")],
-    ])
-
-
-def experts_portfolio_keyboard(portfolios, selected):
-    rows = []
-    for portfolio in portfolios:
-        marker = "✅" if portfolio.id in selected else "⬜"
-        rows.append([InlineKeyboardButton(
-            f"{marker} #{portfolio.id} {portfolio.name}",
-            callback_data=f"experts_pf_{portfolio.id}",
-        )])
-    if selected:
-        rows.append([InlineKeyboardButton(
-            f"🧠 تشغيل التحليل ({len(selected)} محفظة)",
-            callback_data="experts_run",
-        )])
-    rows.append([InlineKeyboardButton("↩️ تغيير التايم فريم", callback_data="experts")])
-    rows.append([InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def _show_experts_timeframes(query):
-    await query.edit_message_text(
-        "🧠 *نظام الخبراء*\n\n"
-        "① اختر التايم فريم\n"
-        "② اختر المحافظ\n"
-        "③ راجع التقرير\n"
-        "④ التنفيذ *يدوي فقط* — مفيش أوامر تلقائية\n\n"
-        "البيانات من MEXC Spot (OHLCV + دفتر الأوامر).",
-        parse_mode="Markdown",
-        reply_markup=experts_timeframe_keyboard(),
-    )
-
-
-async def _show_experts_portfolios(query, context, tid, timeframe):
-    db = SessionLocal()
-    try:
-        portfolios = get_portfolios(db, tid, status="active")
-        if not portfolios:
-            await query.edit_message_text(
-                "📭 لا توجد محافظ نشطة للتحليل.",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-        selected = set(context.user_data.get("experts_portfolios", [p.id for p in portfolios]))
-        selected &= {p.id for p in portfolios}
-        context.user_data["experts_timeframe"] = timeframe
-        context.user_data["experts_portfolios"] = sorted(selected)
-        await query.edit_message_text(
-            f"🧠 *اختيار المحافظ*\n\n"
-            f"التايم فريم: `{timeframe}`\n"
-            "اضغط على المحفظة للتحديد/إلغاء التحديد، ثم *تشغيل التحليل*.",
-            parse_mode="Markdown",
-            reply_markup=experts_portfolio_keyboard(portfolios, selected),
-        )
-    finally:
-        db.close()
-
-
-async def _run_experts_analysis(query, context, tid):
-    import asyncio
-    timeframe = context.user_data.get("experts_timeframe", "1h")
-    selected = [int(value) for value in context.user_data.get("experts_portfolios", [])]
-    if not selected:
-        await query.answer("اختر محفظة واحدة على الأقل", show_alert=True)
-        return
-    db = SessionLocal()
-    try:
-        portfolios = get_portfolios(db, tid, status="active")
-        names = {p.id: p.name for p in portfolios}
-        selected = [pf_id for pf_id in selected if pf_id in names]
-        if not selected:
-            await query.edit_message_text("لا توجد محافظ صالحة للتحليل.", reply_markup=main_menu_keyboard())
-            return
-        portfolio_text = ",".join(str(pf_id) for pf_id in selected)
-        symbols = list(dict.fromkeys(
-            coin.symbol
-            for portfolio in portfolios
-            if portfolio.id in selected
-            for coin in portfolio.coins
-        ))
-        await query.edit_message_text(
-            "⏳ جاري جلب بيانات MEXC Spot الحية (شموع + حجم + دفتر أوامر)...",
-            parse_mode=None,
-        )
-        market_context = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: get_mexc().get_expert_market_context(symbols, timeframe),
-        )
-        engine = get_engine()
-        # أمان مطلق: التحليل فقط — التنفيذ بقرارك أنت من الزر
-        engine.auto_execute_enabled = False
-        result = engine.analyze(
-            timeframe=timeframe,
-            portfolios=portfolio_text,
-            market_context=market_context,
-        )
-        report = engine.full_report(result)
-        selected_names = ", ".join(f"#{pf_id} {names[pf_id]}" for pf_id in selected)
-        data_source = market_context.get("data_source", "غير متاح")
-        detail = market_context.get("detail") or ""
-        action_ar = {"BUY": "شراء ✅", "SELL": "بيع 🔻", "FLAT": "انتظار ⏸"}.get(
-            result.final_action, result.final_action
-        )
-
-        # حالة واضحة
-        db2 = SessionLocal()
-        try:
-            user_settings = get_or_create_user(db2, tid)
-            auto_on = bool(getattr(user_settings, "experts_auto_execute", False))
-        finally:
-            db2.close()
-
-        if result.final_action == "FLAT":
-            if result.risk_veto:
-                status = f"⏸ انتظار — فيتو مخاطر: {result.risk_message}"
-            else:
-                status = "⏸ انتظار — الخبراء متفقون على عدم الدخول (سوق هادئ/حجم ضعيف)"
-        elif result.risk_veto:
-            status = f"⏸ لا تنفيذ — فيتو: {result.risk_message}"
-        else:
-            status = f"📌 إشارة جاهزة: {action_ar}"
-
-        message = (
-            "📊 *تقرير الخبراء*\n\n"
-            f"المحافظ: {selected_names}\n"
-            f"مصدر البيانات: `{data_source}`\n"
-            f"العملات: `{market_context.get('symbols_used', '—')}`\n"
-        )
-        if detail:
-            message += f"تفاصيل: `{detail}`\n"
-        message += (
-            f"التنفيذ التلقائي: *{'مفعّل 🟢' if auto_on else 'معطّل 🔴'}*\n"
-            f"\n*الحالة:* {status}\n\n"
-            f"{report}\n\n"
-        )
-        if result.final_action in ("BUY", "SELL") and not result.risk_veto:
-            if auto_on:
-                message += "⚡ التنفيذ التلقائي مفعّل — سيتم التنفيذ الآن.\n"
-            else:
-                message += "🔒 التنفيذ يدوي: اضغط الزر بالأسفل أو فعّل التلقائي من الإعدادات.\n"
-        else:
-            message += "🔒 مفيش أمر على MEXC من هذا التقرير.\n"
-
-        if len(message) > 3900:
-            message = message[:3897] + "..."
-
-        context.user_data["experts_last_result"] = {
-            "action": result.final_action,
-            "veto": result.risk_veto,
-            "portfolios": portfolio_text,
-            "size": result.size_hint,
-            "reason": result.reason_summary,
-            "timeframe": result.timeframe,
-            "confidence": result.confidence,
-            "most_agree": result.most_agree,
-            "most_disagree": result.most_disagree,
-        }
-
-        buttons = []
-        can_trade = result.final_action in ("BUY", "SELL") and not result.risk_veto
-        if can_trade and not auto_on:
-            buttons.append([InlineKeyboardButton(
-                f"✅ تنفيذ يدوي ({action_ar})",
-                callback_data="experts_exec_confirm",
-            )])
-        buttons.append([InlineKeyboardButton("🔄 تحليل جديد", callback_data="experts")])
-        buttons.append([InlineKeyboardButton("⚙️ إعدادات الخبراء", callback_data="experts_settings")])
-        buttons.append([InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="menu")])
-
-        await query.edit_message_text(
-            message,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-
-        # تنفيذ تلقائي فوري لو مفعّل وفي إشارة صالحة
-        if can_trade and auto_on:
-            await _experts_do_execute(
-                query, context, tid,
-                action=result.final_action,
-                portfolios=portfolio_text,
-                size=result.size_hint,
-                reason=result.reason_summary,
-                timeframe=result.timeframe,
-                confidence=result.confidence,
-                auto=True,
-            )
-    except Exception as e:
-        logger.exception("experts analysis failed")
-        await query.edit_message_text(
-            f"❌ فشل التحليل: {e}\n\nتأكد أن مفاتيح MEXC صحيحة وأن الاتصال متاح.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data="experts")],
-                [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="menu")],
-            ]),
-        )
-    finally:
-        db.close()
-
-
-async def _experts_exec_confirm(query, context):
-    """عرض تأكيد قبل التنفيذ اليدوي."""
-    last = context.user_data.get("experts_last_result") or {}
-    action = last.get("action")
-    if action not in ("BUY", "SELL") or last.get("veto"):
-        await query.answer("مفيش إشارة قابلة للتنفيذ", show_alert=True)
-        return
-    action_ar = "شراء" if action == "BUY" else "بيع"
-    size_ar = {"small": "صغير", "medium": "متوسط", "full": "كامل"}.get(last.get("size"), last.get("size"))
-    text = (
-        "⚠️ *تأكيد التنفيذ اليدوي*\n\n"
-        f"القرار: *{action_ar}*\n"
-        f"المحافظ: `{last.get('portfolios')}`\n"
-        f"الحجم: {size_ar}\n"
-        f"التايم فريم: {last.get('timeframe')}\n"
-        f"الثقة: {last.get('confidence', 0):.0%}\n\n"
-        "هيتنفذ عبر محرك الإشارات على المحافظ المحددة (Spot).\n"
-        "هل متأكد؟"
-    )
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ نعم نفّذ", callback_data="experts_exec_yes"),
-                InlineKeyboardButton("❌ إلغاء", callback_data="experts_exec_no"),
-            ],
-        ]),
-    )
-
-
-async def _experts_do_execute(
-    query_or_bot,
-    context,
-    tid,
-    *,
-    action: str,
-    portfolios: str,
-    size: str,
-    reason: str,
-    timeframe: str,
-    confidence: float,
-    auto: bool = False,
-    chat_id: int = None,
-):
-    """يبني إشارة ExpertsSystem ويمررها لمحرك الإشارات (Spot)."""
-    size_map = {"small": "Small", "medium": "Medium", "full": "Full"}
-    size_txt = size_map.get(size or "small", "Small")
-    reason = (reason or "ExpertsSystem")[:200]
-    portfolios = portfolios or "1"
-
-    signal_text = (
-        f"#SIGNAL\n"
-        f"Source: ExpertsSystem\n"
-        f"Action: {action}\n"
-        f"Reason: {reason} | TF:{timeframe} | Conf:{confidence:.0%}\n"
-        f"Portfolios: {portfolios}\n"
-        f"Size: {size_txt}"
-    )
-    parsed = parse_signal_message(signal_text)
-    if not parsed:
-        msg = "❌ فشل بناء الإشارة من نظام الخبراء."
-        if query_or_bot and hasattr(query_or_bot, "message") and query_or_bot.message:
-            await query_or_bot.message.reply_text(msg)
-        return False
-
-    parsed["portfolios"] = [
-        int(x) for x in str(portfolios).replace(" ", "").split(",") if x.isdigit()
+        [
+            InlineKeyboardButton("💰 زيادة المبلغ", callback_data=f"increase_{pf_id}"),
+            InlineKeyboardButton("🔄 تحديث الأهداف", callback_data=f"refresh_tp_{pf_id}"),
+        ],
+        [
+            InlineKeyboardButton("🔎 فحص الناقص", callback_data=f"check_missing_{pf_id}"),
+            InlineKeyboardButton("📊 إحصائيات", callback_data=f"stats_{pf_id}"),
+        ],
+        [
+            InlineKeyboardButton("♻️ إعادة بناء", callback_data=f"rebuild_{pf_id}"),
+            InlineKeyboardButton("🗑 حذف", callback_data=f"delete_pf_{pf_id}"),
+        ],
+        [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
     ]
-    parsed["source"] = "ExpertsSystem"
-    parsed["action"] = action
-    parsed["reason"] = reason
-    parsed["raw"] = signal_text
-    if context is not None:
-        context.user_data["experts_force_size"] = size or "small"
-
-    target_chat = chat_id
-    if target_chat is None and query_or_bot is not None:
-        if hasattr(query_or_bot, "message") and query_or_bot.message:
-            target_chat = query_or_bot.message.chat_id
-        elif hasattr(query_or_bot, "edit_message_text"):
-            try:
-                target_chat = query_or_bot.message.chat_id
-            except Exception:
-                target_chat = tid
-
-    class _FakeMsg:
-        def __init__(self, cid, bot=None):
-            self.chat_id = cid
-            self.text = signal_text
-            self._bot = bot
-
-        async def reply_text(self, text, **kwargs):
-            if self._bot:
-                await self._bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
-            elif query_or_bot is not None and hasattr(query_or_bot, "message") and query_or_bot.message:
-                await query_or_bot.message.reply_text(text, **kwargs)
-
-    bot = None
-    if context is not None and hasattr(context, "bot"):
-        bot = context.bot
-    elif query_or_bot is not None and hasattr(query_or_bot, "get_bot"):
-        bot = query_or_bot.get_bot()
-
-    class _FakeUpdate:
-        def __init__(self, user_id, cid, bot_ref):
-            self.effective_user = type("U", (), {"id": user_id})()
-            self.message = _FakeMsg(cid, bot_ref)
-            self.effective_chat = type("C", (), {"id": cid})()
-
-    fake = _FakeUpdate(tid, target_chat or tid, bot)
-    mode = "تلقائي" if auto else "يدوي"
-    try:
-        if query_or_bot is not None and hasattr(query_or_bot, "edit_message_text") and not auto:
-            try:
-                await query_or_bot.edit_message_text(
-                    f"⏳ جاري التنفيذ {mode} ({action}) على: {portfolios} ..."
-                )
-            except Exception:
-                pass
-        await execute_signal(fake, context, parsed)
-        notify = (
-            f"{'⚡ تنفيذ تلقائي' if auto else '✅ تنفيذ يدوي'} ({action})\n"
-            f"المحافظ: {portfolios}\n"
-            f"الحجم: {size_txt} | TF: {timeframe}\n"
-            f"راجع الرسائل أعلاه لنتيجة كل محفظة."
-        )
-        if bot and target_chat:
-            await bot.send_message(chat_id=target_chat, text=notify)
-        elif query_or_bot is not None and hasattr(query_or_bot, "message") and query_or_bot.message:
-            await query_or_bot.message.reply_text(notify, reply_markup=main_menu_keyboard())
-        return True
-    except Exception as e:
-        logger.exception("experts exec failed")
-        err = f"❌ فشل التنفيذ ({mode}): {e}"
-        if bot and target_chat:
-            await bot.send_message(chat_id=target_chat, text=err)
-        elif query_or_bot is not None and hasattr(query_or_bot, "message") and query_or_bot.message:
-            await query_or_bot.message.reply_text(err)
-        return False
-    finally:
-        if context is not None:
-            context.user_data.pop("experts_last_result", None)
-            context.user_data.pop("experts_force_size", None)
-
-
-async def _experts_exec_yes(query, context, tid):
-    """تنفيذ يدوي بعد التأكيد."""
-    last = context.user_data.get("experts_last_result") or {}
-    action = last.get("action")
-    if action not in ("BUY", "SELL") or last.get("veto"):
-        await query.answer("مفيش إشارة قابلة للتنفيذ", show_alert=True)
-        return
-    await _experts_do_execute(
-        query, context, tid,
-        action=action,
-        portfolios=last.get("portfolios") or "1",
-        size=last.get("size") or "small",
-        reason=last.get("reason") or "ExpertsSystem",
-        timeframe=last.get("timeframe") or "1h",
-        confidence=float(last.get("confidence") or 0),
-        auto=False,
-    )
-
-
-def pf_keyboard(pf_id: int, is_running: bool, experts_enabled: bool = False):
-    """واجهة محفظة مبسّطة — إعادة بناء المراكز تغطي الناقص/الاستوبات."""
-    rows = []
-    if is_running:
-        rows.append([InlineKeyboardButton("⏹ إيقاف المحفظة", callback_data=f"stop_{pf_id}")])
-    else:
-        rows.append([InlineKeyboardButton("▶️ تشغيل المحفظة", callback_data=f"start_{pf_id}")])
-    rows.append([InlineKeyboardButton(
-        "🧠 خبراء المحفظة",
-        callback_data=f"pf_experts_{pf_id}",
-    )])
-    rows.append([
-        InlineKeyboardButton("🎯 أهداف TP/SL", callback_data=f"pf_tpsl_{pf_id}"),
-        InlineKeyboardButton("♻️ إعادة بناء المراكز", callback_data=f"rebuild_{pf_id}"),
-    ])
-    rows.append([
-        InlineKeyboardButton("🔄 تحديث الأهداف", callback_data=f"refresh_tpsl_{pf_id}"),
-    ])
-    rows.append([
-        InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
-        InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
-    ])
-    rows.append([InlineKeyboardButton("🗑 حذف المحفظة", callback_data=f"close_{pf_id}")])
-    rows.append([InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="list_pf")])
     return InlineKeyboardMarkup(rows)
-
-
-def pf_experts_keyboard(pf_id: int, enabled: bool, timeframe: str = "1h"):
-    """لوحة تحكم الخبراء داخل محفظة واحدة."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "🔴 إيقاف التلقائي" if enabled else "🟢 تفعيل التلقائي",
-            callback_data=f"pf_exp_toggle_{pf_id}",
-        )],
-        [
-            InlineKeyboardButton(
-                ("✅ 15m" if timeframe == "15m" else "15m"),
-                callback_data=f"pf_exp_tf_{pf_id}_15m",
-            ),
-            InlineKeyboardButton(
-                ("✅ 1h" if timeframe == "1h" else "1h"),
-                callback_data=f"pf_exp_tf_{pf_id}_1h",
-            ),
-            InlineKeyboardButton(
-                ("✅ 4h" if timeframe == "4h" else "4h"),
-                callback_data=f"pf_exp_tf_{pf_id}_4h",
-            ),
-        ],
-        [InlineKeyboardButton("🔍 تحليل الآن", callback_data=f"pf_exp_run_{pf_id}")],
-        [InlineKeyboardButton("⬅️ رجوع للمحفظة", callback_data=f"view_{pf_id}")],
-    ])
 
 
 def _missing_selection_key(pf_id: int) -> str:
@@ -572,30 +159,6 @@ def _missing_reentry_keyboard(pf_id: int, missing_symbols, selected, allow_selec
     return InlineKeyboardMarkup(rows)
 
 
-def sources_keyboard(sources):
-    buttons = []
-    for s in sources:
-        icon = "🟢" if s.enabled else "🔴"
-        buttons.append([InlineKeyboardButton(f"{icon} {s.name}", callback_data=f"view_src_{s.id}")])
-    buttons.append([InlineKeyboardButton("➕ إضافة مصدر جديد", callback_data="create_src")])
-    buttons.append([InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="menu")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def source_detail_keyboard(src_id: int, enabled: bool):
-    rows = []
-    if enabled:
-        rows.append([InlineKeyboardButton("⏹ تعطيل المصدر", callback_data=f"toggle_src_{src_id}")])
-    else:
-        rows.append([InlineKeyboardButton("▶️ تفعيل المصدر", callback_data=f"toggle_src_{src_id}")])
-    rows.append([
-        InlineKeyboardButton("✏️ تعديل", callback_data=f"edit_src_{src_id}"),
-        InlineKeyboardButton("🗑 حذف", callback_data=f"del_src_{src_id}"),
-    ])
-    rows.append([InlineKeyboardButton("⬅️ رجوع للمصادر", callback_data="list_sources")])
-    return InlineKeyboardMarkup(rows)
-
-
 def format_pf(p, current_value: float = None) -> str:
     """عرض محفظة: حالة + خبراء + قيمة + عملات."""
     status = "🟢 شغالة" if p.is_running else "⚪ متوقفة"
@@ -620,11 +183,6 @@ def format_pf(p, current_value: float = None) -> str:
         coins_block = "—"
 
     # حالة الخبراء لهذه المحفظة
-    exp_on = bool(getattr(p, "experts_enabled", False))
-    exp_tf = getattr(p, "experts_timeframe", None) or "1h"
-    exp_action = getattr(p, "experts_last_action", None)
-    exp_at = getattr(p, "experts_last_at", None)
-    exp_sum = getattr(p, "experts_last_summary", None) or ""
     action_ar = {"BUY": "شراء", "SELL": "بيع", "FLAT": "انتظار"}.get(exp_action or "", "—")
     if exp_on:
         exp_line = f"🧠 الخبراء: *مفعّل* | TF `{exp_tf}`"
@@ -946,167 +504,6 @@ async def _do_cleanup(query, context, tid):
         db.close()
 
 
-def parse_signal_message(text: str) -> Optional[Dict[str, Any]]:
-    """
-    يدعم:
-    1) صيغة Whale Alert
-    2) صيغة Arkham (From: ... To: ...)
-    3) الصيغة المنظمة #SIGNAL / إشارة
-    """
-    if not text or len(text) < 8:
-        return None
-
-    text = text.strip()
-    lower = text.lower()
-    result = {
-        "source": None,
-        "action": None,
-        "reason": "",
-        "portfolios": [],
-        "size": "full",
-        "raw": text[:1500],
-        "usd_value": 0.0,
-        "symbol": None,
-    }
-
-    # ========== 1) صيغة Whale Alert ==========
-    # مثال:
-    # 🚨🚨🚨 1,720 $BTC (131,865,141 USD) transferred from Coinbase Institutional to unknown new wallet
-    # 🚨🚨 828 $BTC (63,648,815 USD) transferred from unknown wallet to #Coinbase
-
-    whale_pattern = re.search(
-        r"(?:🚨\s*)*"                                    # الإيموجي
-        r"([\d,]+(?:\.\d+)?)\s*"                       # الكمية
-        r"\$?([A-Za-z0-9]+)\s*"                          # الرمز (BTC / ETH / XRP ...)
-        r"\(([\d,]+(?:\.\d+)?)\s*USD\)\s*"           # القيمة بالدولار
-        r"transferred from\s+(.+?)\s+to\s+(.+?)(?:\n|Details|$)",
-        text,
-        re.IGNORECASE | re.DOTALL
-    )
-
-    if whale_pattern:
-        amount_str = whale_pattern.group(1).replace(",", "")
-        symbol = whale_pattern.group(2).upper().lstrip("$")
-        usd_str = whale_pattern.group(3).replace(",", "")
-        from_entity = whale_pattern.group(4).strip()
-        to_entity = whale_pattern.group(5).strip()
-
-        try:
-            result["usd_value"] = float(usd_str)
-        except Exception:
-            result["usd_value"] = 0.0
-
-        result["symbol"] = symbol
-        result["source"] = "WhaleAlert"
-        result["reason"] = f"{amount_str} {symbol} | {from_entity} → {to_entity}"
-
-        from_l = from_entity.lower()
-        to_l = to_entity.lower()
-
-        # قائمة المنصات المعروفة
-        exchanges = [
-            "coinbase", "kraken", "binance", "uphold", "revolut", "falconx",
-            "bitfinex", "okx", "okex", "bybit", "huobi", "htx", "gemini",
-            "bitstamp", "zero hash", "zerohash", "bitgo", "cumberland",
-            "jump", "wintermute", "b2c2", "galaxy", "robinhood", "crypto.com",
-            "kucoin", "mexc", "gate.io", "gateio", "bitget"
-        ]
-
-        def is_exchange(s: str) -> bool:
-            return any(ex in s for ex in exchanges)
-
-        def is_unknown(s: str) -> bool:
-            return "unknown" in s or "new wallet" in s
-
-        # قائمة العملات المستقرة
-        stables = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "USDD", "BUSD", "PYUSD"}
-        is_stable = symbol in stables
-
-        # --- قواعد القرار ---
-        if is_exchange(from_l) and is_unknown(to_l):
-            # سحب من منصة → محفظة غير معروفة
-            if is_stable:
-                result["action"] = "SELL"      # سحب فلوس = غالباً سلبي
-            else:
-                result["action"] = "BUY"       # سحب BTC/ETH = تجميع
-        elif is_unknown(from_l) and is_exchange(to_l):
-            # إيداع في منصة
-            if is_stable:
-                result["action"] = "BUY"       # إيداع فلوس = استعداد للشراء (إيجابي)
-            else:
-                result["action"] = "SELL"      # إيداع BTC/ETH = استعداد للبيع
-        elif is_exchange(from_l) and is_exchange(to_l):
-            # تحويل بين منصات → نتجاهل
-            return None
-        else:
-            # تحويلات أخرى ضعيفة الإشارة
-            return None
-
-        if result["action"]:
-            return result
-
-    # ========== 2) صيغة Arkham ==========
-    from_m = re.search(r"From\s*:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
-    to_m = re.search(r"To\s*:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
-    if from_m and to_m:
-        from_s = from_m.group(1).strip().lower()
-        to_s = to_m.group(1).strip().lower()
-        is_from_cb = "coinbase" in from_s
-        is_to_cb = "coinbase" in to_s
-        is_from_br = "blackrock" in from_s or "ibit" in from_s or "etha" in from_s
-        is_to_br = "blackrock" in to_s or "ibit" in to_s or "etha" in to_s
-
-        if is_from_cb and is_to_br:
-            result["action"] = "BUY"
-            result["source"] = "BlackRock"
-            result["reason"] = f"Withdrawal from Coinbase → BlackRock | {from_m.group(1).strip()[:80]}"
-        elif is_from_br and is_to_cb:
-            result["action"] = "SELL"
-            result["source"] = "BlackRock"
-            result["reason"] = f"Deposit to Coinbase from BlackRock | {to_m.group(1).strip()[:80]}"
-
-        usd_m = re.search(r"\(\$([0-9,]+(?:\.[0-9]+)?)\s*([KMB])?\)", text, re.IGNORECASE)
-        if usd_m:
-            num = float(usd_m.group(1).replace(",", ""))
-            mult = {"K": 1e3, "M": 1e6, "B": 1e9}.get((usd_m.group(2) or "").upper(), 1)
-            result["usd_value"] = num * mult
-        else:
-            usd_m2 = re.search(r"Value\s*:.*?\$([0-9,]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
-            if usd_m2:
-                result["usd_value"] = float(usd_m2.group(1).replace(",", ""))
-
-        if result["action"]:
-            return result
-
-    # ========== 3) الصيغة المنظمة #SIGNAL ==========
-    if not any(k in lower for k in ("#signal", "إشارة", "اشارة", "signal")):
-        return None
-
-    m = re.search(r"(?:source|المصدر)\s*[:：]\s*(.+)", text, re.IGNORECASE)
-    if m:
-        result["source"] = m.group(1).strip().split("\n")[0].strip()
-    m = re.search(r"(?:action|القرار|قرار)\s*[:：]\s*(.+)", text, re.IGNORECASE)
-    if m:
-        act = m.group(1).strip().upper()
-        if any(x in act for x in ("BUY", "شراء", "LONG")):
-            result["action"] = "BUY"
-        elif any(x in act for x in ("SELL", "بيع", "SHORT")):
-            result["action"] = "SELL"
-    m = re.search(r"(?:reason|السبب|سبب)\s*[:：]\s*(.+)", text, re.IGNORECASE)
-    if m:
-        result["reason"] = m.group(1).strip().split("\n")[0][:300]
-    m = re.search(r"(?:portfolios|المحافظ|محافظ)\s*[:：]\s*([0-9,\s]+)", text, re.IGNORECASE)
-    if m:
-        result["portfolios"] = parse_portfolio_ids(m.group(1))
-    m = re.search(r"(?:size|الحجم|حجم)\s*[:：]\s*(.+)", text, re.IGNORECASE)
-    if m:
-        result["size"] = m.group(1).strip().lower()
-
-    if result["action"] and (result["source"] or result["portfolios"]):
-        return result
-    return None
-
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_admin(update):
         return
@@ -1140,325 +537,40 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def execute_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: Dict):
-    tid = config.ADMIN_TELEGRAM_ID or (update.effective_user.id if update.effective_user else 0)
-    db = SessionLocal()
-    try:
-        source_name = parsed.get("source")
-        action = parsed["action"]
-        reason = parsed.get("reason", "")
-        explicit_pfs = parsed.get("portfolios", [])
-
-        sources = get_signal_sources(db, tid)
-        matched = None
-        enabled_sources = [s for s in sources if s.enabled]
-
-        # 1) مطابقة بالاسم بالظبط
-        if source_name:
-            for s in enabled_sources:
-                if s.name.lower() == source_name.lower():
-                    matched = s
-                    break
-
-        # 2) لو رسالة WhaleAlert أو Arkham ومفيش مطابقة بالاسم:
-        #    فضّل مصدر اسمه فيه whale أو arkham أو blackrock، وإلا أول مصدر مفعل
-        raw_lower = (parsed.get("raw") or "").lower()
-        is_auto_msg = bool(parsed.get("usd_value")) or (
-            ("from:" in raw_lower and "to:" in raw_lower) or
-            "transferred from" in raw_lower
-        )
-        if not matched and is_auto_msg and enabled_sources:
-            for s in enabled_sources:
-                n = s.name.lower()
-                if "whale" in n or "arkham" in n or "blackrock" in n or "ibit" in n:
-                    matched = s
-                    break
-            if not matched:
-                matched = enabled_sources[0]
-
-        if not matched and not explicit_pfs:
-            await update.message.reply_text(
-                f"⚠️ مصدر الإشارة `{source_name or 'Arkham'}` غير موجود أو معطل.\nأضف مصدر مفعل من قائمة مصادر الإشارات.",
-                parse_mode="Markdown"
-            )
-            log_signal(db, tid, action, reason, parsed.get("raw", ""), executed=False, result_msg="مصدر غير موجود")
-            return
-
-        if explicit_pfs:
-            target_ids = explicit_pfs
-        elif matched:
-            target_ids = parse_portfolio_ids(
-                matched.buy_portfolio_ids if action == "BUY" else matched.sell_portfolio_ids
-            )
-        else:
-            target_ids = []
-
-        if not target_ids:
-            await update.message.reply_text("⚠️ مفيش محافظ مرتبطة بهذه الإشارة.")
-            log_signal(db, tid, action, reason, parsed.get("raw", ""),
-                       source_id=matched.id if matched else None, executed=False, result_msg="لا محافظ")
-            return
-
-        # ----- تحقق القيمة -----
-        usd_val = float(parsed.get("usd_value") or 0)
-        if matched and usd_val > 0 and usd_val < matched.min_usd:
-            await update.message.reply_text(
-                f"ℹ️ تم تجاهل الإشارة — القيمة `${usd_val:,.0f}` أقل من الحد `${matched.min_usd:,.0f}`",
-                parse_mode="Markdown"
-            )
-            log_signal(db, tid, action, reason, parsed.get("raw", ""),
-                       source_id=matched.id, executed=False,
-                       result_msg=f"تحت الحد: {usd_val} < {matched.min_usd}")
-            return
-
-        # ----- تجميع التحويلات (بدون انتهاء زمني) -----
-        needed = matched.max_tx_count if matched and matched.max_tx_count > 0 else 1
-
-        if matched and needed > 1:
-            # كل الـ pending المفتوحة لنفس المصدر + القرار
-            old_pending = db.query(SignalLog).filter(
-                SignalLog.source_id == matched.id,
-                SignalLog.action == action,
-                SignalLog.executed == False,
-                SignalLog.result_msg.like("pending%")
-            ).all()
-
-            # مجموع المبالغ السابقة من result_msg: pending 1/2 | usd=123
-            prev_usd = 0.0
-            for op in old_pending:
-                m = re.search(r"usd=([0-9.]+)", op.result_msg or "")
-                if m:
-                    prev_usd += float(m.group(1))
-
-            current_count = len(old_pending) + 1
-            total_usd = prev_usd + (usd_val if usd_val > 0 else 0)
-
-            if current_count < needed:
-                log_signal(
-                    db, tid, action, reason, parsed.get("raw", ""),
-                    source_id=matched.id, executed=False,
-                    result_msg=f"pending {current_count}/{needed} | usd={usd_val or 0}"
-                )
-                remaining = needed - current_count
-
-                def fmt_m(v):
-                    if v >= 1_000_000:
-                        return f"${v/1_000_000:.2f}M"
-                    if v >= 1_000:
-                        return f"${v/1_000:.1f}K"
-                    return f"${v:,.0f}"
-
-                await update.message.reply_text(
-                    f"📥 *تحويل مستلم* ({current_count}/{needed})\n"
-                    f"المصدر: `{matched.name}`\n"
-                    f"القرار: *{action}*\n"
-                    f"السبب: {reason or '—'}\n\n"
-                    f"💵 آخر تحويل: *{fmt_m(usd_val)}*\n"
-                    f"💰 المجموع حتى الآن: *{fmt_m(total_usd)}*\n"
-                    f"🎯 الحد الأدنى للتحويل: *{fmt_m(matched.min_usd)}*\n\n"
-                    f"⏳ باقي *{remaining}* تحويل"
-                    f"{'ات' if remaining >= 3 else ('ان' if remaining == 2 else '')}"
-                    f" لتنفيذ الأمر.",
-                    parse_mode="Markdown"
-                )
-                return
-            else:
-                # وصلنا للعدد → صفّر الـ pending + اعرض المجموع
-                total_usd = prev_usd + (usd_val if usd_val > 0 else 0)
-                for op in old_pending:
-                    op.result_msg = f"consumed→exec {needed}"
-                db.commit()
-                # نخزن المجموع عشان يظهر في تقرير التنفيذ
-                parsed["usd_value"] = total_usd
-                parsed["reason"] = (reason or "") + f" | مجموع {needed} تحويلات ≈ ${total_usd:,.0f}"
-                reason = parsed["reason"]
-
-        # ----- cooldown بعد تنفيذ فقط (لو > 0) -----
-        if matched and matched.cooldown_minutes and matched.cooldown_minutes > 0:
-            cutoff = datetime.utcnow() - timedelta(minutes=matched.cooldown_minutes)
-            recent = db.query(SignalLog).filter(
-                SignalLog.source_id == matched.id,
-                SignalLog.action == action,
-                SignalLog.executed == True,
-                SignalLog.created_at >= cutoff
-            ).first()
-            if recent:
-                await update.message.reply_text(
-                    f"⏳ تم التنفيذ مؤخراً — انتظر {matched.cooldown_minutes} دقيقة قبل تنفيذ جديد."
-                )
-                return
-
-        if matched:
-            if action == "BUY" and not matched.allow_buy:
-                await update.message.reply_text("⚠️ المصدر ده مش مسموح له إشارات شراء.")
-                return
-            if action == "SELL" and not matched.allow_sell:
-                await update.message.reply_text("⚠️ المصدر ده مش مسموح له إشارات بيع.")
-                return
-
-        executed, errors = [], []
-        for pf_id in target_ids:
-            p = get_portfolio(db, pf_id, tid)
-            if not p or p.status != "active":
-                errors.append(f"#{pf_id} غير موجودة")
-                continue
-            coins = [c.symbol for c in p.coins]
-            if not coins:
-                errors.append(f"#{pf_id} بدون عملات")
-                continue
-            try:
-                if action == "BUY":
-                    if p.is_running:
-                        errors.append(f"#{pf_id} شغالة بالفعل")
-                        continue
-                    result = get_reb().start_portfolio(
-                        coins=coins, total_usdt=p.investment_usdt,
-                        method=p.allocation_method or "equal", min_trade_usdt=5.0, dry_run=False,
-                    )
-                    if result.get("errors") and not result.get("executed"):
-                        errors.append(f"#{pf_id}: {result['errors'][0]}")
-                    else:
-                        set_portfolio_running(db, pf_id, True)
-                        executed.append(f"#{pf_id} ({p.name})")
-                        log_action(db, tid, "signal_buy", f"Signal from {source_name}", True, pf_id)
-                else:
-                    if not p.is_running:
-                        errors.append(f"#{pf_id} متوقفة بالفعل")
-                        continue
-                    sell_result = get_reb().stop_portfolio(coins, dry_run=False)
-                    for sold in sell_result.get("executed", []):
-                        symbol = str(sold.get("symbol", "")).split("/")[0]
-                        coin = next((c for c in p.coins if c.symbol == symbol), None)
-                        amount = float(sold.get("amount") or 0)
-                        usdt = float(sold.get("usdt") or 0)
-                        exit_price = usdt / amount if amount > 0 else 0.0
-                        if coin and amount > 0 and float(coin.entry_price or 0) > 0:
-                            record_trade_event(
-                                db, tid, p.id, coin.id, symbol, "manual_stop",
-                                coin.entry_price, exit_price, amount,
-                                (exit_price - coin.entry_price) * amount,
-                                details="Signal sell",
-                            )
-                    set_portfolio_running(db, pf_id, False)
-                    executed.append(f"#{pf_id} ({p.name})")
-                    log_action(db, tid, "signal_sell", f"Signal from {source_name}", True, pf_id)
-            except Exception as e:
-                errors.append(f"#{pf_id}: {e}")
-                logger.exception(f"Signal exec error pf={pf_id}")
-
-        lines = [
-            f"{'✅' if executed else '⚠️'} *نتيجة الإشارة*",
-            f"المصدر: `{source_name or '—'}`",
-            f"القرار: *{action}*",
-            f"السبب: {reason or '—'}",
-            "",
-        ]
-        if executed:
-            lines.append("تم التنفيذ على:")
-            for e in executed:
-                lines.append(f"  • {e}")
-        if errors:
-            lines.append("\nملاحظات:")
-            for e in errors:
-                lines.append(f"  • {e}")
-        msg = "\n".join(lines)
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        log_signal(db, tid, action, reason, parsed.get("raw", ""),
-                   source_id=matched.id if matched else None,
-                   executed=bool(executed), result_msg=msg[:500])
-    finally:
-        db.close()
-
-
 async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
+    if not await ensure_admin(update):
+        return
 
     text = update.message.text
-    # رسائل الإشارات (Whale Alert / #SIGNAL / Arkham) تُقبل حتى لو جاية من Forwarder
-    is_signal_like = (
-        "transferred from" in text.lower()
-        or "#signal" in text.lower()
-        or "إشارة" in text
-        or "اشارة" in text
-        or text.strip().lower().startswith("from:")
-    )
-
-    if not is_signal_like:
-        # رسائل عادية → لازم تكون من الأدمن
-        if not await ensure_admin(update):
-            return
-    else:
-        # رسائل إشارات → ننفذها باسم الأدمن
-        if not config.ADMIN_TELEGRAM_ID:
-            return
 
     if context.user_data.get("waiting"):
-        # Per-portfolio TP/SL edit
         pf_edit = context.user_data.get("edit_pf_tpsl")
         if pf_edit:
-            if not await ensure_admin(update):
-                return
             try:
                 val = float(text.strip().replace("%", "").replace(",", "."))
                 if val < 0 or val > 100:
                     await update.message.reply_text("أدخل رقم بين 0 و 100 (0 = استخدم العام).")
                     return
+                field = pf_edit.get("field")
+                pf_id = pf_edit.get("pf_id")
                 db = SessionLocal()
                 try:
-                    pf = get_portfolio(db, pf_edit["pf_id"], update.effective_user.id)
-                    if not pf:
+                    p = get_portfolio(db, pf_id, update.effective_user.id)
+                    if not p:
                         await update.message.reply_text("المحفظة غير موجودة.")
-                        context.user_data.clear()
                         return
-                    field = pf_edit["field"]
-                    setattr(pf, field, None if val == 0 else val)
-                    db.commit()
-                    await update.message.reply_text(
-                        f"✅ تم ضبط `{field}` للمحفظة *{pf.name}* إلى " + ("العام" if val == 0 else f"`{val}%`"),
-                        parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🎯 أهداف المحفظة", callback_data=f"pf_tpsl_{pf.id}")],
-                            [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf.id}")],
-                        ]),
-                    )
-                finally:
-                    db.close()
-                context.user_data.clear()
-            except ValueError:
-                await update.message.reply_text("أدخل رقم صحيح.")
-            return
-
-        # Handle TP/SL percentage edit from global settings
-        edit_key = context.user_data.get("edit_setting")
-        if edit_key in ("take_profit_pct", "stop_loss_pct", "tp1_pct", "tp2_pct", "tp3_pct", "tp1_sell_pct", "tp2_sell_pct"):
-            if not await ensure_admin(update):
-                return
-            try:
-                val = float(text.strip().replace("%", "").replace(",", "."))
-                if val <= 0 or val > 100:
-                    await update.message.reply_text("أدخل نسبة بين 0.1 و 100.")
-                    return
-                db = SessionLocal()
-                try:
-                    user = get_or_create_user(db, update.effective_user.id)
-                    setattr(user, edit_key, val)
-                    db.commit()
-                    labels = {
-                        "take_profit_pct": "هدف الربح",
-                        "stop_loss_pct": "وقف الخسارة",
-                        "tp1_pct": "الهدف 1",
-                        "tp2_pct": "الهدف 2",
-                        "tp3_pct": "الهدف 3",
-                        "tp1_sell_pct": "نسبة البيع عند الهدف 1",
-                        "tp2_sell_pct": "نسبة البيع عند الهدف 2",
-                    }
-                    label = labels.get(edit_key, edit_key)
-                    await update.message.reply_text(
-                        f"✅ تم ضبط *{label}* إلى `{val}%`",
-                        parse_mode="Markdown",
-                        reply_markup=main_menu_keyboard(),
-                    )
+                    if field and hasattr(p, field):
+                        setattr(p, field, val if val > 0 else None)
+                        db.commit()
+                        await update.message.reply_text(
+                            f"✅ تم تحديث `{field}` = `{val}`",
+                            parse_mode="Markdown",
+                            reply_markup=main_menu_keyboard(),
+                        )
+                    else:
+                        await update.message.reply_text("حقل غير معروف.", reply_markup=main_menu_keyboard())
                 finally:
                     db.close()
                 context.user_data.clear()
@@ -1466,10 +578,6 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("أدخل رقم صحيح (مثال: 5)")
             return
         return
-
-    parsed = parse_signal_message(text)
-    if parsed:
-        await execute_signal(update, context, parsed)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1483,75 +591,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data or ""
     tid = update.effective_user.id
-
-    if data == "experts":
-        if not await ensure_admin(update):
-            return
-        context.user_data.pop("experts_portfolios", None)
-        await _show_experts_timeframes(query)
-        return
-
-    if data.startswith("experts_tf_"):
-        if not await ensure_admin(update):
-            return
-        timeframe = data.split("experts_tf_", 1)[1]
-        if timeframe not in {"15m", "1h", "4h", "1d", "1w"}:
-            await query.edit_message_text("تايم فريم غير صالح.", reply_markup=main_menu_keyboard())
-            return
-        await _show_experts_portfolios(query, context, tid, timeframe)
-        return
-
-    if data.startswith("experts_pf_"):
-        if not await ensure_admin(update):
-            return
-        try:
-            pf_id = int(data.split("experts_pf_", 1)[1])
-        except ValueError:
-            await query.edit_message_text("محفظة غير صالحة.", reply_markup=main_menu_keyboard())
-            return
-        selected = set(context.user_data.get("experts_portfolios", []))
-        if pf_id in selected:
-            selected.remove(pf_id)
-        else:
-            selected.add(pf_id)
-        context.user_data["experts_portfolios"] = sorted(selected)
-        await _show_experts_portfolios(
-            query,
-            context,
-            tid,
-            context.user_data.get("experts_timeframe", "1h"),
-        )
-        return
-
-    if data == "experts_run":
-        if not await ensure_admin(update):
-            return
-        await _run_experts_analysis(query, context, tid)
-        return
-
-    if data == "experts_exec_confirm":
-        if not await ensure_admin(update):
-            return
-        await _experts_exec_confirm(query, context)
-        return
-
-    if data == "experts_exec_yes":
-        if not await ensure_admin(update):
-            return
-        await _experts_exec_yes(query, context, tid)
-        return
-
-    if data == "experts_exec_no":
-        if not await ensure_admin(update):
-            return
-        await query.edit_message_text(
-            "تم إلغاء التنفيذ.\nيمكنك إعادة التحليل في أي وقت.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 تحليل جديد", callback_data="experts")],
-                [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="menu")],
-            ]),
-        )
-        return
 
     if data == "menu":
         await query.edit_message_text(
@@ -1618,7 +657,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons = [
                 [InlineKeyboardButton(
                     f"{'🟢' if p.is_running else '⚪'}"
-                    f"{'🧠' if getattr(p, 'experts_enabled', False) else ''}"
                     f" #{p.id} {p.name} · {p.investment_usdt:.0f}$",
                     callback_data=f"view_{p.id}",
                 )]
@@ -1655,7 +693,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=pf_keyboard(
                     p.id, p.is_running,
-                    experts_enabled=bool(getattr(p, "experts_enabled", False)),
                 ),
             )
         finally:
@@ -1663,648 +700,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ——— خبراء داخل المحفظة ———
-    if data.startswith("pf_experts_"):
-        if not await ensure_admin(update):
-            return
-        pf_id = int(data.split("pf_experts_")[1])
-        db = SessionLocal()
-        try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
-                return
-            enabled = bool(getattr(p, "experts_enabled", False))
-            tf = getattr(p, "experts_timeframe", None) or "1h"
-            action = getattr(p, "experts_last_action", None)
-            at = getattr(p, "experts_last_at", None)
-            summary = getattr(p, "experts_last_summary", None) or "—"
-            action_ar = {"BUY": "شراء ✅", "SELL": "بيع 🔻", "FLAT": "انتظار ⏸"}.get(action or "", "لم يُحلَّل")
-            when = at.strftime("%Y-%m-%d %H:%M UTC") if at else "—"
-            text = (
-                f"🧠 *خبراء المحفظة* `#{p.id}` {p.name}\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"التلقائي: *{'🟢 مفعّل' if enabled else '🔴 معطّل'}*\n"
-                f"التايم فريم: `{tf}`\n"
-                f"آخر قرار: *{action_ar}*\n"
-                f"وقت القرار: `{when}`\n"
-                f"ملخص:\n_{summary[:300]}_\n\n"
-                "• *تفعيل التلقائي* = البوت يحلل هذه المحفظة وينفّذ لو الشروط اتحققت\n"
-                "• *تحليل الآن* = تقرير فوري بدون انتظار الفاصل"
-            )
-            await query.edit_message_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=pf_experts_keyboard(pf_id, enabled, tf),
-            )
-        finally:
-            db.close()
-        return
-
-    if data.startswith("pf_exp_toggle_"):
-        if not await ensure_admin(update):
-            return
-        pf_id = int(data.split("pf_exp_toggle_")[1])
-        db = SessionLocal()
-        try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
-                return
-            p.experts_enabled = not bool(getattr(p, "experts_enabled", False))
-            db.commit()
-            await query.answer(
-                "تم تفعيل خبراء هذه المحفظة" if p.experts_enabled else "تم إيقاف خبراء هذه المحفظة",
-                show_alert=True,
-            )
-        finally:
-            db.close()
-        # أعد فتح لوحة الخبراء (بدون تعديل query.data لأنه immutable)
-        db = SessionLocal()
-        try:
-            p = get_portfolio(db, pf_id, tid)
-            enabled = bool(getattr(p, "experts_enabled", False))
-            tf = getattr(p, "experts_timeframe", None) or "1h"
-            action = getattr(p, "experts_last_action", None)
-            at = getattr(p, "experts_last_at", None)
-            summary = getattr(p, "experts_last_summary", None) or "—"
-            action_ar = {"BUY": "شراء ✅", "SELL": "بيع 🔻", "FLAT": "انتظار ⏸"}.get(action or "", "لم يُحلَّل")
-            when = at.strftime("%Y-%m-%d %H:%M UTC") if at else "—"
-            text = (
-                f"🧠 *خبراء المحفظة* `#{p.id}` {p.name}\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"التلقائي: *{'🟢 مفعّل' if enabled else '🔴 معطّل'}*\n"
-                f"التايم فريم: `{tf}`\n"
-                f"آخر قرار: *{action_ar}*\n"
-                f"وقت القرار: `{when}`\n"
-                f"ملخص:\n_{summary[:300]}_\n"
-            )
-            await query.edit_message_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=pf_experts_keyboard(pf_id, enabled, tf),
-            )
-        finally:
-            db.close()
-        return
-
-    if data.startswith("pf_exp_tf_"):
-        if not await ensure_admin(update):
-            return
-        # pf_exp_tf_{id}_{tf}
-        rest = data.split("pf_exp_tf_", 1)[1]
-        parts = rest.split("_", 1)
-        if len(parts) != 2:
-            await query.answer("خطأ", show_alert=True)
-            return
-        pf_id = int(parts[0])
-        tf = parts[1]
-        if tf not in {"15m", "1h", "4h", "1d", "1w"}:
-            await query.answer("تايم فريم غير صالح", show_alert=True)
-            return
-        db = SessionLocal()
-        try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
-                return
-            p.experts_timeframe = tf
-            db.commit()
-            await query.answer(f"التايم فريم: {tf}", show_alert=True)
-            enabled = bool(getattr(p, "experts_enabled", False))
-            action = getattr(p, "experts_last_action", None)
-            at = getattr(p, "experts_last_at", None)
-            summary = getattr(p, "experts_last_summary", None) or "—"
-            action_ar = {"BUY": "شراء ✅", "SELL": "بيع 🔻", "FLAT": "انتظار ⏸"}.get(action or "", "لم يُحلَّل")
-            when = at.strftime("%Y-%m-%d %H:%M UTC") if at else "—"
-            text = (
-                f"🧠 *خبراء المحفظة* `#{p.id}` {p.name}\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"التلقائي: *{'🟢 مفعّل' if enabled else '🔴 معطّل'}*\n"
-                f"التايم فريم: `{tf}`\n"
-                f"آخر قرار: *{action_ar}*\n"
-                f"وقت القرار: `{when}`\n"
-                f"ملخص:\n_{summary[:300]}_"
-            )
-            await query.edit_message_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=pf_experts_keyboard(pf_id, enabled, tf),
-            )
-        finally:
-            db.close()
-        return
-
-    if data.startswith("pf_exp_run_"):
-        if not await ensure_admin(update):
-            return
-        import asyncio
-        from datetime import datetime as _dt
-        pf_id = int(data.split("pf_exp_run_")[1])
-        db = SessionLocal()
-        try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
-                return
-            symbols = [c.symbol for c in p.coins]
-            if not symbols:
-                await query.answer("المحفظة بدون عملات", show_alert=True)
-                return
-            tf = getattr(p, "experts_timeframe", None) or "1h"
-            await query.edit_message_text(
-                f"⏳ تحليل خبراء محفظة *{p.name}* (`{tf}`) على MEXC Spot...",
-                parse_mode="Markdown",
-            )
-            market_context = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: get_mexc().get_expert_market_context(symbols, tf),
-            )
-            engine = get_engine()
-            engine.auto_execute_enabled = False
-            result = engine.analyze(
-                timeframe=tf,
-                portfolios=str(pf_id),
-                market_context=market_context,
-            )
-            # حفظ الحالة داخل المحفظة
-            p.experts_last_action = result.final_action
-            p.experts_last_at = _dt.utcnow()
-            p.experts_last_summary = (result.reason_summary or "")[:500]
-            db.commit()
-
-            action_ar = {"BUY": "شراء ✅", "SELL": "بيع 🔻", "FLAT": "انتظار ⏸"}.get(
-                result.final_action, result.final_action
-            )
-            report = engine.full_report(result)
-            enabled = bool(getattr(p, "experts_enabled", False))
-            can_trade = result.final_action in ("BUY", "SELL") and not result.risk_veto
-
-            msg = (
-                f"📊 *تقرير خبراء* `#{pf_id}` {p.name}\n"
-                f"المصدر: `{market_context.get('data_source', '—')}`\n"
-                f"العملات: `{market_context.get('symbols_used', '—')}`\n"
-                f"التلقائي: *{'🟢' if enabled else '🔴'}*\n\n"
-                f"{report}\n"
-            )
-            if can_trade and enabled:
-                msg += "\n⚡ التلقائي مفعّل — جاري التنفيذ..."
-            elif can_trade:
-                msg += "\n📌 إشارة جاهزة — فعّل التلقائي أو نفّذ يدوياً من الزر."
-            else:
-                msg += "\n⏸ لا تنفيذ — السوق لا يستوفي شروط الدخول."
-
-            if len(msg) > 3900:
-                msg = msg[:3897] + "..."
-
-            buttons = []
-            if can_trade and not enabled:
-                context.user_data["experts_last_result"] = {
-                    "action": result.final_action,
-                    "veto": result.risk_veto,
-                    "portfolios": str(pf_id),
-                    "size": result.size_hint,
-                    "reason": result.reason_summary,
-                    "timeframe": result.timeframe,
-                    "confidence": result.confidence,
-                }
-                buttons.append([InlineKeyboardButton(
-                    f"✅ تنفيذ يدوي ({action_ar})",
-                    callback_data="experts_exec_confirm",
-                )])
-            buttons.append([InlineKeyboardButton("🔍 تحليل مرة أخرى", callback_data=f"pf_exp_run_{pf_id}")])
-            buttons.append([InlineKeyboardButton("🧠 لوحة الخبراء", callback_data=f"pf_experts_{pf_id}")])
-            buttons.append([InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")])
-
-            await query.edit_message_text(
-                msg,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
-
-            if can_trade and enabled:
-                await _experts_do_execute(
-                    query, context, tid,
-                    action=result.final_action,
-                    portfolios=str(pf_id),
-                    size=result.size_hint,
-                    reason=result.reason_summary,
-                    timeframe=result.timeframe,
-                    confidence=result.confidence,
-                    auto=True,
-                )
-        except Exception as e:
-            logger.exception("pf experts run failed")
-            await query.edit_message_text(
-                f"❌ فشل التحليل: {e}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ رجوع", callback_data=f"view_{pf_id}")],
-                ]),
-            )
-        finally:
-            db.close()
-        return
-
-    # الأزرار القديمة (إحصائيات / ناقصة / استوبات) → إعادة بناء المراكز
-    if data.startswith("stats_"):
-        pf_id = int(data.split("_")[1])
-        await query.edit_message_text(
-            "ℹ️ تم دمج الإحصائيات والتفاصيل داخل شاشة المحفظة.\n"
-            "لضبط المراكز والأهداف استخدم *♻️ إعادة بناء المراكز*.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("♻️ إعادة بناء المراكز", callback_data=f"rebuild_{pf_id}")],
-                [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
-            ]),
-        )
-        return
-
-    if data.startswith("missing_toggle_") or data.startswith("missing_confirm_") or data.startswith("missing_"):
-        try:
-            if data.startswith("missing_toggle_"):
-                pf_id = int(data.split("_")[2])
-            else:
-                pf_id = int(data.split("_")[1])
-        except (IndexError, ValueError):
-            await query.edit_message_text("طلب غير صالح.", reply_markup=main_menu_keyboard())
-            return
-        await query.edit_message_text(
-            "ℹ️ العملات الناقصة صارت جزء من *♻️ إعادة بناء المراكز*.\nجاري التنفيذ...",
-            parse_mode="Markdown",
-        )
-        await _do_rebuild_positions(query, tid, pf_id)
-        return
-
-    if data.startswith("stopped_"):
-        pf_id = int(data.split("_")[1])
-        await query.edit_message_text(
-            "ℹ️ الاستوبات وإعادة الدخول صارت تلقائية + عبر *♻️ إعادة بناء المراكز*.\n"
-            "جاري إعادة البناء...",
-            parse_mode="Markdown",
-        )
-        await _do_rebuild_positions(query, tid, pf_id)
-        return
-
-    if data == "balance":
-        try:
-            data_bal = get_mexc().get_portfolio_value()
-            free = get_mexc().get_free_usdt()
-            lines = [f"💰 *الرصيد الكلي:* `{data_bal['total_usdt']:.2f}` USDT", f"USDT حر: `{free:.2f}`\n"]
-            for asset, info in sorted(data_bal["assets"].items(), key=lambda x: -x[1]["usdt_value"])[:15]:
-                if info["usdt_value"] < 0.5:
-                    continue
-                lines.append(f"`{asset}`: {info['amount']:.6g} ≈ `{info['usdt_value']:.2f}$`")
-            await query.edit_message_text("\n".join(lines), parse_mode="Markdown",
-                                          reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="menu")]]))
-        except Exception as e:
-            await query.edit_message_text(f"خطأ:\n`{e}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
-        return
-
-    if data == "cleanup_db":
-        await _show_cleanup_scan(query, context, tid)
-        return
-
-    if data == "cleanup_confirm":
-        if not context.user_data.get("cleanup_ready"):
-            await query.edit_message_text(
-                "انتهت صلاحية تقرير التنظيف. شغّل الفحص مرة أخرى.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🧹 فحص قاعدة البيانات", callback_data="cleanup_db")],
-                    [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
-                ]),
-            )
-            return
-        await _do_cleanup(query, context, tid)
-        return
-
-    if data == "settings":
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, tid)
-            tp1 = getattr(user, "tp1_pct", 3.0) or 3.0
-            tp2 = getattr(user, "tp2_pct", 5.0) or 5.0
-            tp3 = getattr(user, "tp3_pct", 8.0) or 8.0
-            s1 = getattr(user, "tp1_sell_pct", 40.0) or 40.0
-            s2 = getattr(user, "tp2_sell_pct", 30.0) or 30.0
-            sl = getattr(user, "stop_loss_pct", 3.0) or 3.0
-            auto = bool(getattr(user, "experts_auto_execute", False))
-            text = (
-                f"⚙️ *الإعدادات*\n\n"
-                f"أقل صفقة: `{user.min_trade_usdt}` USDT\n"
-                f"أقصى عملات: `{user.max_coins_per_portfolio}`\n\n"
-                f"🎯 *الهدف 1:* `{tp1}%` (بيع `{s1}%`)\n"
-                f"🎯 *الهدف 2:* `{tp2}%` (بيع `{s2}%`)\n"
-                f"🎯 *الهدف 3:* `{tp3}%` (الباقي)\n"
-                f"🛡 *وقف الخسارة:* `{sl}%`\n\n"
-                f"🧠 *تنفيذ الخبراء التلقائي:* {'🟢 مفعّل' if auto else '🔴 معطّل'}"
-            )
-            await query.edit_message_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎯 هدف 1 %", callback_data="edit_tp1"),
-                     InlineKeyboardButton("بيع عند 1 %", callback_data="edit_tp1_sell")],
-                    [InlineKeyboardButton("🎯 هدف 2 %", callback_data="edit_tp2"),
-                     InlineKeyboardButton("بيع عند 2 %", callback_data="edit_tp2_sell")],
-                    [InlineKeyboardButton("🎯 هدف 3 %", callback_data="edit_tp3")],
-                    [InlineKeyboardButton("🛡 وقف الخسارة %", callback_data="edit_sl")],
-                    [InlineKeyboardButton("🧠 إعدادات الخبراء", callback_data="experts_settings")],
-                    [InlineKeyboardButton("⬅️ رجوع", callback_data="menu")],
-                ]),
-            )
-        finally:
-            db.close()
-        return
-
-    if data == "experts_settings":
-        if not await ensure_admin(update):
-            return
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, tid)
-            auto = bool(getattr(user, "experts_auto_execute", False))
-            tf = getattr(user, "experts_auto_timeframe", None) or "1h"
-            interval = int(getattr(user, "experts_auto_interval_min", None) or 60)
-            pfs = (getattr(user, "experts_auto_portfolios", None) or "").strip() or "كل المحافظ النشطة"
-            text = (
-                "🧠 *إعدادات تنفيذ الخبراء*\n\n"
-                f"التلقائي: *{'🟢 مفعّل' if auto else '🔴 معطّل'}*\n"
-                f"التايم فريم: `{tf}`\n"
-                f"كل كم دقيقة: `{interval}`\n"
-                f"المحافظ: `{pfs}`\n\n"
-                "لما يكون مفعّل والبوت شغال:\n"
-                "• يحلل السوق لوحده حسب الفاصل\n"
-                "• لو القرار شراء/بيع ومرّ من المخاطر → ينفّذ على Spot\n"
-                "• يبعتلك رسالة بالنتيجة (حتى لو نايم)\n\n"
-                "⚠️ الحجم دائماً صغير/متوسط — مش Full."
-            )
-            await query.edit_message_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🔴 إيقاف التلقائي" if auto else "🟢 تفعيل التلقائي",
-                        callback_data="experts_auto_toggle",
-                    )],
-                    [
-                        InlineKeyboardButton("15m", callback_data="experts_auto_tf_15m"),
-                        InlineKeyboardButton("1h", callback_data="experts_auto_tf_1h"),
-                        InlineKeyboardButton("4h", callback_data="experts_auto_tf_4h"),
-                    ],
-                    [
-                        InlineKeyboardButton("كل 30د", callback_data="experts_auto_int_30"),
-                        InlineKeyboardButton("كل 60د", callback_data="experts_auto_int_60"),
-                        InlineKeyboardButton("كل 120د", callback_data="experts_auto_int_120"),
-                    ],
-                    [InlineKeyboardButton(
-                        "📌 حفظ المحافظ من آخر تحليل",
-                        callback_data="experts_auto_save_pfs",
-                    )],
-                    [InlineKeyboardButton("⬅️ رجوع", callback_data="settings")],
-                ]),
-            )
-        finally:
-            db.close()
-        return
-
-    if data == "experts_auto_toggle":
-        if not await ensure_admin(update):
-            return
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, tid)
-            user.experts_auto_execute = not bool(getattr(user, "experts_auto_execute", False))
-            # لو مفيش محافظ محفوظة خذ كل النشطة
-            if user.experts_auto_execute and not (getattr(user, "experts_auto_portfolios", None) or "").strip():
-                pfs = get_portfolios(db, tid, status="active")
-                user.experts_auto_portfolios = ",".join(str(p.id) for p in pfs)
-            db.commit()
-            state = "مفعّل 🟢" if user.experts_auto_execute else "معطّل 🔴"
-            await query.answer(f"التنفيذ التلقائي أصبح: {state}", show_alert=True)
-        finally:
-            db.close()
-        # أعد عرض الإعدادات (بدون تعديل query.data لأنه immutable)
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, tid)
-            auto = bool(getattr(user, "experts_auto_execute", False))
-            tf = getattr(user, "experts_auto_timeframe", None) or "1h"
-            interval = int(getattr(user, "experts_auto_interval_min", None) or 60)
-            pfs = (getattr(user, "experts_auto_portfolios", None) or "").strip() or "كل المحافظ النشطة"
-            text = (
-                "🧠 *إعدادات تنفيذ الخبراء*\n\n"
-                f"التلقائي: *{'🟢 مفعّل' if auto else '🔴 معطّل'}*\n"
-                f"التايم فريم: `{tf}`\n"
-                f"كل كم دقيقة: `{interval}`\n"
-                f"المحافظ: `{pfs}`\n\n"
-                "لما يكون مفعّل والبوت شغال:\n"
-                "• يحلل السوق لوحده حسب الفاصل\n"
-                "• لو القرار شراء/بيع ومرّ من المخاطر → ينفّذ على Spot\n"
-                "• يبعتلك رسالة بالنتيجة (حتى لو نايم)\n\n"
-                "⚠️ الحجم دائماً صغير/متوسط — مش Full."
-            )
-            await query.edit_message_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🔴 إيقاف التلقائي" if auto else "🟢 تفعيل التلقائي",
-                        callback_data="experts_auto_toggle",
-                    )],
-                    [
-                        InlineKeyboardButton("15m", callback_data="experts_auto_tf_15m"),
-                        InlineKeyboardButton("1h", callback_data="experts_auto_tf_1h"),
-                        InlineKeyboardButton("4h", callback_data="experts_auto_tf_4h"),
-                    ],
-                    [
-                        InlineKeyboardButton("كل 30د", callback_data="experts_auto_int_30"),
-                        InlineKeyboardButton("كل 60د", callback_data="experts_auto_int_60"),
-                        InlineKeyboardButton("كل 120د", callback_data="experts_auto_int_120"),
-                    ],
-                    [InlineKeyboardButton(
-                        "📌 حفظ المحافظ من آخر تحليل",
-                        callback_data="experts_auto_save_pfs",
-                    )],
-                    [InlineKeyboardButton("⬅️ رجوع", callback_data="settings")],
-                ]),
-            )
-        finally:
-            db.close()
-        return
-
-    if data.startswith("experts_auto_tf_"):
-        if not await ensure_admin(update):
-            return
-        tf = data.split("experts_auto_tf_", 1)[1]
-        if tf not in {"15m", "1h", "4h", "1d", "1w"}:
-            await query.answer("تايم فريم غير صالح", show_alert=True)
-            return
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, tid)
-            user.experts_auto_timeframe = tf
-            db.commit()
-            await query.answer(f"التايم فريم: {tf}", show_alert=True)
-        finally:
-            db.close()
-        # refresh settings view (بدون تعديل query.data)
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, tid)
-            auto = bool(getattr(user, "experts_auto_execute", False))
-            tf = getattr(user, "experts_auto_timeframe", None) or "1h"
-            interval = int(getattr(user, "experts_auto_interval_min", None) or 60)
-            pfs = (getattr(user, "experts_auto_portfolios", None) or "").strip() or "كل المحافظ النشطة"
-            await query.edit_message_text(
-                "🧠 *إعدادات تنفيذ الخبراء*\n\n"
-                f"التلقائي: *{'🟢 مفعّل' if auto else '🔴 معطّل'}*\n"
-                f"التايم فريم: `{tf}`\n"
-                f"كل كم دقيقة: `{interval}`\n"
-                f"المحافظ: `{pfs}`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🔴 إيقاف التلقائي" if auto else "🟢 تفعيل التلقائي",
-                        callback_data="experts_auto_toggle",
-                    )],
-                    [
-                        InlineKeyboardButton("15m", callback_data="experts_auto_tf_15m"),
-                        InlineKeyboardButton("1h", callback_data="experts_auto_tf_1h"),
-                        InlineKeyboardButton("4h", callback_data="experts_auto_tf_4h"),
-                    ],
-                    [
-                        InlineKeyboardButton("كل 30د", callback_data="experts_auto_int_30"),
-                        InlineKeyboardButton("كل 60د", callback_data="experts_auto_int_60"),
-                        InlineKeyboardButton("كل 120د", callback_data="experts_auto_int_120"),
-                    ],
-                    [InlineKeyboardButton("📌 حفظ المحافظ من آخر تحليل", callback_data="experts_auto_save_pfs")],
-                    [InlineKeyboardButton("⬅️ رجوع", callback_data="settings")],
-                ]),
-            )
-        finally:
-            db.close()
-        return
-
-    if data.startswith("experts_auto_int_"):
-        if not await ensure_admin(update):
-            return
-        try:
-            mins = int(data.split("experts_auto_int_", 1)[1])
-        except ValueError:
-            await query.answer("قيمة غير صالحة", show_alert=True)
-            return
-        if mins not in (30, 60, 120, 180, 240):
-            mins = 60
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, tid)
-            user.experts_auto_interval_min = mins
-            db.commit()
-            await query.answer(f"الفاصل: كل {mins} دقيقة", show_alert=True)
-        finally:
-            db.close()
-        # refresh settings view
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, tid)
-            auto = bool(getattr(user, "experts_auto_execute", False))
-            tf = getattr(user, "experts_auto_timeframe", None) or "1h"
-            interval = int(getattr(user, "experts_auto_interval_min", None) or 60)
-            pfs = (getattr(user, "experts_auto_portfolios", None) or "").strip() or "كل المحافظ النشطة"
-            await query.edit_message_text(
-                "🧠 *إعدادات تنفيذ الخبراء*\n\n"
-                f"التلقائي: *{'🟢 مفعّل' if auto else '🔴 معطّل'}*\n"
-                f"التايم فريم: `{tf}`\n"
-                f"كل كم دقيقة: `{interval}`\n"
-                f"المحافظ: `{pfs}`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🔴 إيقاف التلقائي" if auto else "🟢 تفعيل التلقائي",
-                        callback_data="experts_auto_toggle",
-                    )],
-                    [
-                        InlineKeyboardButton("15m", callback_data="experts_auto_tf_15m"),
-                        InlineKeyboardButton("1h", callback_data="experts_auto_tf_1h"),
-                        InlineKeyboardButton("4h", callback_data="experts_auto_tf_4h"),
-                    ],
-                    [
-                        InlineKeyboardButton("كل 30د", callback_data="experts_auto_int_30"),
-                        InlineKeyboardButton("كل 60د", callback_data="experts_auto_int_60"),
-                        InlineKeyboardButton("كل 120د", callback_data="experts_auto_int_120"),
-                    ],
-                    [InlineKeyboardButton("📌 حفظ المحافظ من آخر تحليل", callback_data="experts_auto_save_pfs")],
-                    [InlineKeyboardButton("⬅️ رجوع", callback_data="settings")],
-                ]),
-            )
-        finally:
-            db.close()
-        return
-
-    if data == "experts_auto_save_pfs":
-        if not await ensure_admin(update):
-            return
-        last = context.user_data.get("experts_last_result") or {}
-        pfs = last.get("portfolios") or ""
-        if not pfs:
-            selected = context.user_data.get("experts_portfolios") or []
-            pfs = ",".join(str(x) for x in selected)
-        if not pfs:
-            await query.answer("مفيش محافظ محفوظة من تحليل سابق — شغّل تحليل أولاً", show_alert=True)
-            return
-        db = SessionLocal()
-        try:
-            user = get_or_create_user(db, tid)
-            user.experts_auto_portfolios = pfs
-            db.commit()
-            await query.answer(f"تم حفظ المحافظ: {pfs}", show_alert=True)
-        finally:
-            db.close()
-        return
-
-    edit_map = {
-        "edit_tp1": ("tp1_pct", "نسبة الهدف 1 (مثال: 3)"),
-        "edit_tp2": ("tp2_pct", "نسبة الهدف 2 (مثال: 5)"),
-        "edit_tp3": ("tp3_pct", "نسبة الهدف 3 (مثال: 8)"),
-        "edit_tp1_sell": ("tp1_sell_pct", "نسبة البيع عند الهدف 1 من الكمية (مثال: 40)"),
-        "edit_tp2_sell": ("tp2_sell_pct", "نسبة البيع عند الهدف 2 من الكمية (مثال: 30)"),
-        "edit_sl": ("stop_loss_pct", "نسبة وقف الخسارة (مثال: 3)"),
-    }
-    if data in edit_map:
-        field, prompt = edit_map[data]
-        context.user_data["waiting"] = True
-        context.user_data["edit_setting"] = field
-        await query.edit_message_text(
-            f"أرسل *{prompt}*:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="settings")]]),
-        )
-        return
-
-    if data == "create_pf":
-        context.user_data["create"] = {}
-        context.user_data["waiting"] = True
-        await query.edit_message_text("أرسل *اسم المحفظة*:", parse_mode="Markdown")
-        return CREATE_NAME
-
-    if data.startswith("start_"):
-        await _do_start(query, tid, int(data.split("_")[1]))
-        return
-    if data.startswith("stop_"):
-        await _do_stop(query, tid, int(data.split("_")[1]))
-        return
-    if data.startswith("refresh_tpsl_"):
-        await _do_refresh_tpsl(query, tid, int(data.split("_")[2]))
-        return
-
-    if data.startswith("rebuild_"):
-        await _do_rebuild_positions(query, tid, int(data.split("_")[1]))
-        return
-        return
-    if data.startswith("reentry_"):
-        await _do_manual_reentry(query, tid, int(data.split("_")[1]))
-        return
-
-    # Per-portfolio TP/SL settings
     if data.startswith("pf_tpsl_"):
         pf_id = int(data.split("_")[2])
         db = SessionLocal()
@@ -2442,105 +837,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("confirm_close_"):
         await _do_close(query, tid, int(data.split("_")[2]))
         return
-
-    # Signal sources
-    if data == "list_sources":
-        db = SessionLocal()
-        try:
-            sources = get_signal_sources(db, tid)
-            text = "📡 *مصادر الإشارات:*\n\n" if sources else "لا توجد مصادر بعد.\nاضغط ➕ لإضافة مصدر."
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=sources_keyboard(sources))
-        finally:
-            db.close()
-        return
-
-    if data == "create_src":
-        context.user_data["src"] = {}
-        context.user_data["waiting"] = True
-        await query.edit_message_text("أرسل *اسم المصدر* (مثال: BlackRock):", parse_mode="Markdown")
-        return SRC_NAME
-
-    if data.startswith("view_src_"):
-        src_id = int(data.split("_")[2])
-        db = SessionLocal()
-        try:
-            s = get_signal_source(db, src_id, tid)
-            if not s:
-                await query.edit_message_text("المصدر غير موجود.", reply_markup=main_menu_keyboard())
-                return
-            await query.edit_message_text(format_source(s), parse_mode="Markdown",
-                                          reply_markup=source_detail_keyboard(s.id, s.enabled))
-        finally:
-            db.close()
-        return
-
-    if data.startswith("toggle_src_"):
-        src_id = int(data.split("_")[2])
-        db = SessionLocal()
-        try:
-            s = get_signal_source(db, src_id, tid)
-            if s:
-                s.enabled = not s.enabled
-                db.commit()
-                await query.edit_message_text(format_source(s), parse_mode="Markdown",
-                                              reply_markup=source_detail_keyboard(s.id, s.enabled))
-        finally:
-            db.close()
-        return
-
-    if data.startswith("del_src_"):
-        src_id = int(data.split("_")[2])
-        db = SessionLocal()
-        try:
-            delete_signal_source(db, src_id, tid)
-            sources = get_signal_sources(db, tid)
-            await query.edit_message_text("✅ تم حذف المصدر.", reply_markup=sources_keyboard(sources))
-        finally:
-            db.close()
-        return
-
-    if data.startswith("edit_src_"):
-        src_id = int(data.split("_")[2])
-        context.user_data["edit_src_id"] = src_id
-        await query.edit_message_text(
-            "✏️ *اختر الحقل للتعديل:*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("الحد الأدنى ($)", callback_data=f"editf_min_usd_{src_id}")],
-                [InlineKeyboardButton("أقصى تحويلات", callback_data=f"editf_max_tx_{src_id}")],
-                [InlineKeyboardButton("محافظ الشراء", callback_data=f"editf_buy_pfs_{src_id}")],
-                [InlineKeyboardButton("محافظ البيع", callback_data=f"editf_sell_pfs_{src_id}")],
-                [InlineKeyboardButton("التبريد (دقيقة)", callback_data=f"editf_cooldown_{src_id}")],
-                [InlineKeyboardButton("⬅️ رجوع", callback_data=f"view_src_{src_id}")],
-            ])
-        )
-        return
-
-    if data.startswith("editf_"):
-        parts = data.split("_")
-        src_id = int(parts[-1])
-        field = "_".join(parts[1:-1])
-        field_map = {
-            "min_usd": ("min_usd", "أرسل الحد الأدنى بالدولار (مثال: 1000000):"),
-            "max_tx": ("max_tx_count", "أرسل أقصى عدد تحويلات (مثال: 3):"),
-            "buy_pfs": ("buy_portfolio_ids", "أرسل أرقام محافظ الشراء مفصولة بفاصلة (مثال: 21,22)\nأو none:"),
-            "sell_pfs": ("sell_portfolio_ids", "أرسل أرقام محافظ البيع مفصولة بفاصلة (مثال: 21,22)\nأو none:"),
-            "cooldown": ("cooldown_minutes", "أرسل مدة التبريد بالدقائق (مثال: 30):"),
-        }
-        if field not in field_map:
-            await query.edit_message_text("حقل غير معروف.", reply_markup=main_menu_keyboard())
-            return
-        db_field, prompt = field_map[field]
-        context.user_data["edit_src_id"] = src_id
-        context.user_data["edit_src_field"] = db_field
-        context.user_data["waiting"] = True
-        await query.edit_message_text(
-            prompt,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ رجوع", callback_data=f"edit_src_{src_id}")]
-            ])
-        )
-        return EDIT_SRC_VALUE
 
 
 async def _do_rebuild_positions(query, tid, pf_id):
@@ -3827,215 +2123,6 @@ async def increase_amount_msg(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-async def src_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if len(name) < 2:
-        await update.message.reply_text("الاسم قصير جداً.")
-        return SRC_NAME
-    context.user_data["src"]["name"] = name
-    await update.message.reply_text("أرسل *الحد الأدنى للقيمة بالدولار* (مثال: 15000000):", parse_mode="Markdown")
-    return SRC_MIN_USD
-
-
-async def src_min_usd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = float(update.message.text.strip().replace(",", "").replace("_", ""))
-        context.user_data["src"]["min_usd"] = val
-    except ValueError:
-        await update.message.reply_text("أدخل رقم صحيح.")
-        return SRC_MIN_USD
-    await update.message.reply_text("أرسل *أقصى عدد تحويلات* (مثال: 3):")
-    return SRC_MAX_TX
-
-
-async def src_max_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = int(update.message.text.strip())
-        context.user_data["src"]["max_tx_count"] = val
-    except ValueError:
-        await update.message.reply_text("أدخل رقم صحيح.")
-        return SRC_MAX_TX
-    await update.message.reply_text("أرسل *أرقام محافظ الشراء* مفصولة بفاصلة (مثال: 1,3,5)\nأو `none`:", parse_mode="Markdown")
-    return SRC_BUY_PFS
-
-
-async def src_buy_pfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    context.user_data["src"]["buy_portfolio_ids"] = "" if text == "none" else text.replace(" ", "")
-    await update.message.reply_text("أرسل *أرقام محافظ البيع* مفصولة بفاصلة (مثال: 2,4)\nأو `none`:", parse_mode="Markdown")
-    return SRC_SELL_PFS
-
-
-async def src_sell_pfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    data = context.user_data["src"]
-    data["sell_portfolio_ids"] = "" if text == "none" else text.replace(" ", "")
-    db = SessionLocal()
-    try:
-        src = create_signal_source(
-            db, update.effective_user.id,
-            name=data["name"],
-            min_usd=data.get("min_usd", 15_000_000),
-            max_tx_count=data.get("max_tx_count", 3),
-            buy_portfolio_ids=data.get("buy_portfolio_ids", ""),
-            sell_portfolio_ids=data.get("sell_portfolio_ids", ""),
-        )
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ تم إنشاء مصدر *{src.name}*\n\n{format_source(src)}",
-            parse_mode="Markdown", reply_markup=main_menu_keyboard())
-    finally:
-        db.close()
-    return ConversationHandler.END
-
-
-async def edit_src_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    src_id = context.user_data.get("edit_src_id")
-    field = context.user_data.get("edit_src_field")
-    text = update.message.text.strip()
-    if not src_id or not field:
-        context.user_data.clear()
-        await update.message.reply_text("حدث خطأ.", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
-    kwargs = {}
-    try:
-        if field == "min_usd":
-            kwargs["min_usd"] = float(text.replace(",", "").replace("_", ""))
-        elif field == "max_tx_count":
-            kwargs["max_tx_count"] = int(text)
-        elif field == "cooldown_minutes":
-            kwargs["cooldown_minutes"] = int(text)
-        elif field in ("buy_portfolio_ids", "sell_portfolio_ids"):
-            kwargs[field] = "" if text.lower() == "none" else text.replace(" ", "")
-        else:
-            await update.message.reply_text("حقل غير مدعوم.")
-            return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text(
-            "قيمة غير صحيحة، حاول مرة أخرى.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ رجوع", callback_data=f"edit_src_{src_id}")]
-            ])
-        )
-        return EDIT_SRC_VALUE
-
-    db = SessionLocal()
-    try:
-        src = update_signal_source(db, src_id, **kwargs)
-        context.user_data.clear()
-        if src:
-            await update.message.reply_text(
-                f"✅ تم التعديل\n\n{format_source(src)}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✏️ تعديل تاني", callback_data=f"edit_src_{src_id}")],
-                    [InlineKeyboardButton("📡 المصادر", callback_data="list_sources")],
-                    [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
-                ])
-            )
-        else:
-            await update.message.reply_text("المصدر غير موجود.", reply_markup=main_menu_keyboard())
-    finally:
-        db.close()
-    return ConversationHandler.END
-
-
-async def experts_auto_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    تشغيل دوري: لكل محفظة experts_enabled=True يحلل وينفّذ لو الشروط اتحققت.
-    الفاصل الافتراضي 60 دقيقة من آخر تحليل للمحفظة.
-    """
-    import asyncio
-    from datetime import datetime, timedelta
-
-    db = SessionLocal()
-    try:
-        # محافظ مفعّل عليها الخبراء
-        portfolios = (
-            db.query(Portfolio)
-            .filter(Portfolio.status == "active", Portfolio.experts_enabled == True)  # noqa: E712
-            .all()
-        )
-        if not portfolios:
-            return
-
-        # فاصل عام من إعدادات المستخدم (أو 60)
-        user_intervals = {}
-        for p in portfolios:
-            try:
-                tid = p.telegram_id
-                if tid not in user_intervals:
-                    user = get_or_create_user(db, tid)
-                    user_intervals[tid] = int(getattr(user, "experts_auto_interval_min", None) or 60)
-
-                interval = max(15, min(user_intervals[tid], 720))
-                last = getattr(p, "experts_last_at", None)
-                now = datetime.utcnow()
-                if last and (now - last) < timedelta(minutes=interval):
-                    continue
-
-                symbols = [c.symbol for c in p.coins]
-                if not symbols:
-                    continue
-
-                tf = getattr(p, "experts_timeframe", None) or "1h"
-                market_context = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda syms=symbols, t=tf: get_mexc().get_expert_market_context(syms, t),
-                )
-                engine = get_engine()
-                engine.auto_execute_enabled = False
-                result = engine.analyze(
-                    timeframe=tf,
-                    portfolios=str(p.id),
-                    market_context=market_context,
-                )
-
-                p.experts_last_action = result.final_action
-                p.experts_last_at = now
-                p.experts_last_summary = (result.reason_summary or "")[:500]
-                db.commit()
-
-                bot = context.bot
-                action_ar = {"BUY": "شراء", "SELL": "بيع", "FLAT": "انتظار"}.get(
-                    result.final_action, result.final_action
-                )
-                summary = (
-                    f"🧠 *تحليل تلقائي* `#{p.id}` {p.name}\n"
-                    f"القرار: *{action_ar}* | TF: `{tf}`\n"
-                    f"الثقة: {result.confidence:.0%}\n"
-                    f"المخاطر: {result.risk_message or '—'}\n"
-                    f"مصدر: `{market_context.get('data_source', '—')}`"
-                )
-                try:
-                    await bot.send_message(chat_id=tid, text=summary, parse_mode="Markdown")
-                except Exception:
-                    logger.exception("experts notify failed pf=%s", p.id)
-
-                if result.final_action in ("BUY", "SELL") and not result.risk_veto:
-                    await _experts_do_execute(
-                        None,
-                        context,
-                        tid,
-                        action=result.final_action,
-                        portfolios=str(p.id),
-                        size=result.size_hint,
-                        reason=result.reason_summary,
-                        timeframe=result.timeframe,
-                        confidence=result.confidence,
-                        auto=True,
-                        chat_id=tid,
-                    )
-            except Exception:
-                logger.exception("experts_auto_job pf %s failed", getattr(p, "id", "?"))
-                db.rollback()
-    except Exception:
-        logger.exception("experts_auto_job error")
-    finally:
-        db.close()
-
-
 async def _auto_system_start(query, tid: int):
     """تفعيل الإدارة الذكية على محافظ المستخدم بعد إنشائها يدوياً."""
     db = SessionLocal()
@@ -4460,33 +2547,91 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
             pf = coin.portfolio
             tid = pf.telegram_id if pf else config.ADMIN_TELEGRAM_ID
 
-            if act["action"] == "tp1_hit":
+            if act["action"] == "tp_full_close":
+                remaining_before = float(coin.remaining_amount or coin.amount or 0)
+                filled_amount = float(act.get("filled_amount") or remaining_before)
+                filled_amount = min(filled_amount, remaining_before) if remaining_before > 0 else filled_amount
+                fill_price = float(act.get("fill_price") or act.get("price") or 0)
+                stage = act.get("stage") or "tp"
+                pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount if fill_price and coin.entry_price else 0
+                record_trade_event(
+                    db, tid, pf.id, coin.id, symbol, stage if stage != "balance_zero" else "tp_full",
+                    coin.entry_price, fill_price, filled_amount, pnl,
+                    details=f"Full close ({stage})",
+                )
+                update_coin_position(
+                    db, coin.id,
+                    position_status="closed",
+                    current_sl_price=0.0,
+                    remaining_amount=0.0,
+                    amount=0.0,
+                    tp1_order_id=None,
+                    tp2_order_id=None,
+                    tp3_order_id=None,
+                    tp_order_id=None,
+                )
+                msg = (
+                    f"✅ *إغلاق كامل* — `{symbol}`\n"
+                    f"السعر: `{act['price']:.6g}`\n"
+                    f"تم بيع الكمية كلها (هدف واحد / رصيد صفر)\n"
+                    f"المحفظة: *{pf.name if pf else '—'}*"
+                )
+                try:
+                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
+                except Exception:
+                    pass
+
+            elif act["action"] == "tp1_hit":
                 remaining_before = float(coin.remaining_amount or coin.amount or 0)
                 filled_amount = float(act.get("filled_amount") or 0)
                 if filled_amount <= 0:
                     filled_amount = remaining_before * 0.40
                 filled_amount = min(filled_amount, remaining_before)
+                # لو بعد الخصم مفيش باقي → إغلاق كامل
+                new_rem = max(0.0, remaining_before - filled_amount)
                 fill_price = float(act.get("fill_price") or act.get("price") or coin.tp1_price or 0)
                 pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount
-                record_trade_event(
-                    db, tid, pf.id, coin.id, symbol, "tp1",
-                    coin.entry_price, fill_price, filled_amount, pnl,
-                    details="TP1 filled",
-                )
-                update_coin_position(
-                    db, coin.id,
-                    position_status="tp1_hit",
-                    # Break-even is the original entry, not TP1.
-                    current_sl_price=coin.entry_price,
-                    remaining_amount=max(0.0, remaining_before - filled_amount),
-                    tp1_order_id=None,
-                )
-                msg = (
-                    f"🎯 *تحقق الهدف 1* — `{symbol}`\n"
-                    f"السعر: `{act['price']:.6g}`\n"
-                    f"تم نقل الاستوب إلى سعر الدخول `{coin.entry_price:.6g}`\n"
-                    f"المحفظة: *{pf.name if pf else '—'}*"
-                )
+                if new_rem <= 0 or new_rem < remaining_before * 0.05:
+                    record_trade_event(
+                        db, tid, pf.id, coin.id, symbol, "tp1",
+                        coin.entry_price, fill_price, filled_amount, pnl,
+                        details="TP1 full close",
+                    )
+                    update_coin_position(
+                        db, coin.id,
+                        position_status="closed",
+                        current_sl_price=0.0,
+                        remaining_amount=0.0,
+                        amount=0.0,
+                        tp1_order_id=None,
+                        tp2_order_id=None,
+                        tp3_order_id=None,
+                        tp_order_id=None,
+                    )
+                    msg = (
+                        f"✅ *إغلاق كامل (هدف 1)* — `{symbol}`\n"
+                        f"السعر: `{act['price']:.6g}`\n"
+                        f"المحفظة: *{pf.name if pf else '—'}*"
+                    )
+                else:
+                    record_trade_event(
+                        db, tid, pf.id, coin.id, symbol, "tp1",
+                        coin.entry_price, fill_price, filled_amount, pnl,
+                        details="TP1 filled",
+                    )
+                    update_coin_position(
+                        db, coin.id,
+                        position_status="tp1_hit",
+                        current_sl_price=coin.entry_price,
+                        remaining_amount=new_rem,
+                        tp1_order_id=None,
+                    )
+                    msg = (
+                        f"🎯 *تحقق الهدف 1* — `{symbol}`\n"
+                        f"السعر: `{act['price']:.6g}`\n"
+                        f"تم نقل الاستوب إلى سعر الدخول `{coin.entry_price:.6g}`\n"
+                        f"المحفظة: *{pf.name if pf else '—'}*"
+                    )
                 try:
                     await context.bot.send_message(tid, msg, parse_mode="Markdown")
                 except Exception:
@@ -4498,33 +2643,60 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 if filled_amount <= 0:
                     filled_amount = remaining_before * 0.50
                 filled_amount = min(filled_amount, remaining_before)
+                new_rem = max(0.0, remaining_before - filled_amount)
                 fill_price = float(act.get("fill_price") or act.get("price") or coin.tp2_price or 0)
                 pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount
-                record_trade_event(
-                    db, tid, pf.id, coin.id, symbol, "tp2",
-                    coin.entry_price, fill_price, filled_amount, pnl,
-                    details="TP2 filled",
-                )
-                update_coin_position(
-                    db, coin.id,
-                    position_status="tp2_hit",
-                    current_sl_price=act["new_sl"],
-                    remaining_amount=max(0.0, remaining_before - filled_amount),
-                    tp2_order_id=None,
-                )
-                msg = (
-                    f"🎯 *تحقق الهدف 2* — `{symbol}`\n"
-                    f"السعر: `{act['price']:.6g}`\n"
-                    f"تم رفع الاستوب لحماية الربح إلى `{act['new_sl']:.6g}`\n"
-                    f"(الجزء المتبقي يعمل بـ Trailing Stop)\n"
-                    f"المحفظة: *{pf.name if pf else '—'}*"
-                )
+                if new_rem <= 0 or new_rem < remaining_before * 0.05:
+                    record_trade_event(
+                        db, tid, pf.id, coin.id, symbol, "tp2",
+                        coin.entry_price, fill_price, filled_amount, pnl,
+                        details="TP2 full close",
+                    )
+                    update_coin_position(
+                        db, coin.id,
+                        position_status="closed",
+                        current_sl_price=0.0,
+                        remaining_amount=0.0,
+                        amount=0.0,
+                        tp1_order_id=None,
+                        tp2_order_id=None,
+                        tp3_order_id=None,
+                        tp_order_id=None,
+                    )
+                    msg = (
+                        f"✅ *إغلاق كامل (هدف 2)* — `{symbol}`\n"
+                        f"السعر: `{act['price']:.6g}`\n"
+                        f"المحفظة: *{pf.name if pf else '—'}*"
+                    )
+                else:
+                    record_trade_event(
+                        db, tid, pf.id, coin.id, symbol, "tp2",
+                        coin.entry_price, fill_price, filled_amount, pnl,
+                        details="TP2 filled",
+                    )
+                    update_coin_position(
+                        db, coin.id,
+                        position_status="tp2_hit",
+                        current_sl_price=act["new_sl"],
+                        remaining_amount=new_rem,
+                        tp2_order_id=None,
+                    )
+                    msg = (
+                        f"🎯 *تحقق الهدف 2* — `{symbol}`\n"
+                        f"السعر: `{act['price']:.6g}`\n"
+                        f"تم رفع الاستوب لحماية الربح إلى `{act['new_sl']:.6g}`\n"
+                        f"(الجزء المتبقي يعمل بـ Trailing Stop)\n"
+                        f"المحفظة: *{pf.name if pf else '—'}*"
+                    )
                 try:
                     await context.bot.send_message(tid, msg, parse_mode="Markdown")
                 except Exception:
                     pass
 
             elif act["action"] == "pump_mode":
+                # لا تتابع لو المركز اتقفل أو مفيش كمية
+                if (coin.position_status or "") == "closed" or float(coin.remaining_amount or coin.amount or 0) <= 0:
+                    continue
                 new_sl = float(act.get("new_sl") or 0)
                 gain = float(act.get("gain_pct") or 0)
                 trail_pct = float(act.get("trail_pct") or 3.5)
@@ -4804,13 +2976,6 @@ def main():
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
         )
         logger.info("Position monitor job scheduled (every 45s)")
-        app.job_queue.run_repeating(
-            experts_auto_job,
-            interval=60,
-            first=45,
-            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 60},
-        )
-        logger.info("Experts auto job scheduled (check every 60s)")
         # تحديث أهداف ذكي خفيف: كل 10 دقائق، أقصى 4 عملات، وكل عملة كل 3 ساعات
         app.job_queue.run_repeating(
             smart_levels_refresh_job,
@@ -4841,21 +3006,11 @@ def main():
         await on_callback(update, context)
         return INCREASE_AMOUNT
 
-    async def entry_create_src(update, context):
-        await on_callback(update, context)
-        return SRC_NAME
-
-    async def entry_edit_src(update, context):
-        await on_callback(update, context)
-        return EDIT_SRC_VALUE
-
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(entry_create, pattern="^create_pf$"),
             CallbackQueryHandler(entry_addcoin, pattern="^addcoin_"),
             CallbackQueryHandler(entry_increase, pattern="^increase_"),
-            CallbackQueryHandler(entry_create_src, pattern="^create_src$"),
-            CallbackQueryHandler(entry_edit_src, pattern="^editf_"),
         ],
         states={
             CREATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_name)],
@@ -4863,12 +3018,6 @@ def main():
             CREATE_COINS: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_coins)],
             ADD_COIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_coin_msg)],
             INCREASE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, increase_amount_msg)],
-            SRC_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_name)],
-            SRC_MIN_USD: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_min_usd)],
-            SRC_MAX_TX: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_max_tx)],
-            SRC_BUY_PFS: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_buy_pfs)],
-            SRC_SELL_PFS: [MessageHandler(filters.TEXT & ~filters.COMMAND, src_sell_pfs)],
-            EDIT_SRC_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_src_value)],
         },
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
         allow_reentry=True,
@@ -4881,7 +3030,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
 
-    logger.info("Bot starting (Portfolio Manager + Signal Engine)...")
+    logger.info("Bot starting (MEXC Portfolio Manager)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
