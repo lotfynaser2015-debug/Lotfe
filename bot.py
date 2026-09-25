@@ -1039,8 +1039,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ——— اختيار وضع التحكم داخل المحفظة ———
+    if data.startswith("mode_cancel_"):
+        pf_id = int(data.split("_")[-1])
+        await query.edit_message_text(
+            "تم إلغاء تغيير الوضع.",
+            reply_markup=pf_keyboard(pf_id, False),
+        )
+        return
     if data.startswith("mode_"):
-        pf_id = int(data.split("_")[1])
+        import asyncio
+        confirming_manual = data.startswith("mode_confirm_")
+        pf_id = int(data.split("_")[-1])
         db = SessionLocal()
         try:
             p = get_portfolio(db, pf_id, tid)
@@ -1048,36 +1057,118 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
                 return
             current = str(getattr(p, "control_mode", "smart") or "smart").lower()
-            p.control_mode = "manual" if current != "manual" else "smart"
-            applied = 0
-            # Switching is atomic at the database level and never cancels or sells.
-            # When entering manual mode, seed TP/SL values for already-open coins.
-            if p.control_mode == "manual":
+            if current != "manual" and not confirming_manual:
                 user = get_or_create_user(db, tid)
-                def _mode_pct(pf_val, user_val, default):
-                    return float(pf_val) if pf_val is not None and float(pf_val) > 0 else (
-                        float(user_val) if user_val is not None and float(user_val) > 0 else default
+                await query.edit_message_text(
+                    "⚠️ *تأكيد تفعيل الوضع اليدوي*\n\n"
+                    "بعد التأكيد سيتم وضع أوامر بيع Limit فعلية على MEXC باستخدام الإعدادات العامة:\n"
+                    f"TP1: `{float(user.tp1_pct or 3):g}%` — بيع `{float(user.tp1_sell_pct or 40):g}%`\n"
+                    f"TP2: `{float(user.tp2_pct or 5):g}%` — بيع `{float(user.tp2_sell_pct or 30):g}%`\n"
+                    f"TP3: `{float(user.tp3_pct or 8):g}%` — بيع الباقي\n"
+                    f"وقف الخسارة: `{float(user.stop_loss_pct or 3):g}%`\n\n"
+                    "لن يتم بيع فوري أو إيقاف المحفظة. هل تريد المتابعة؟",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ تأكيد ووضع الأهداف", callback_data=f"mode_confirm_{pf_id}")],
+                        [InlineKeyboardButton("❌ إلغاء", callback_data=f"mode_cancel_{pf_id}")],
+                    ]),
+                )
+                return
+
+            # The confirmed manual path uses the user's general TP/SL values.
+            if current != "manual" and confirming_manual:
+                user = get_or_create_user(db, tid)
+                tp1 = float(user.tp1_pct or 3.0)
+                tp2 = float(user.tp2_pct or 5.0)
+                tp3 = float(user.tp3_pct or 8.0)
+                s1 = float(user.tp1_sell_pct or 40.0)
+                s2 = float(user.tp2_sell_pct or 30.0)
+                sl_pct = float(user.stop_loss_pct or 3.0)
+                open_coins = [
+                    c for c in p.coins
+                    if float(c.entry_price or 0) > 0
+                    and float(c.remaining_amount or c.amount or 0) > 0
+                    and (c.position_status or "") in ("open", "tp1_hit", "tp2_hit", "tp3_hit")
+                ]
+                coins_data = [
+                    {
+                        "symbol": c.symbol,
+                        "amount": float(c.remaining_amount or c.amount or 0),
+                        "entry_price": float(c.entry_price),
+                        "tp1_order_id": getattr(c, "tp1_order_id", None),
+                        "tp2_order_id": getattr(c, "tp2_order_id", None),
+                        "tp3_order_id": getattr(c, "tp3_order_id", None),
+                        "tp1_sell_pct_override": s1 if (c.position_status or "") == "open" else 0.0,
+                        "tp2_sell_pct_override": s2 if (c.position_status or "") == "open" else (50.0 if (c.position_status or "") == "tp1_hit" else 0.0),
+                        "place_exchange_orders": True,
+                    }
+                    for c in open_coins
+                ]
+                if coins_data:
+                    results = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: get_reb().place_tp_orders(
+                            coins_data, tp1, tp2, tp3, sl_pct, s1, s2,
+                            control_mode="manual",
+                        ),
                     )
-                tp1 = _mode_pct(getattr(p, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
-                tp2 = _mode_pct(getattr(p, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
-                tp3 = _mode_pct(getattr(p, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
-                sl_pct = _mode_pct(getattr(p, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
-                p.tp1_pct, p.tp2_pct, p.tp3_pct, p.stop_loss_pct = tp1, tp2, tp3, sl_pct
+                    failures = [r for r in results if r.get("error")]
+                    if failures or len(results) != len(coins_data):
+                        # Best-effort rollback: no mode change if all targets
+                        # could not be placed.
+                        for r in results:
+                            for key in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
+                                if r.get(key):
+                                    try:
+                                        get_mexc().cancel_order(r[key], f"{r['symbol']}/USDT")
+                                    except Exception:
+                                        pass
+                        error_text = "\n".join(f"{r.get('symbol')}: {r.get('error')}" for r in failures)
+                        await query.edit_message_text(
+                            "❌ لم يتم تفعيل الوضع اليدوي؛ لم تتغير المحفظة.\n" + error_text,
+                            reply_markup=pf_keyboard(pf_id, p.is_running),
+                        )
+                        return
+                    for coin, result in zip(open_coins, results):
+                        update_coin_position(
+                            db, coin.id,
+                            tp1_price=result.get("tp1_price", 0),
+                            tp2_price=result.get("tp2_price", 0),
+                            tp3_price=result.get("tp3_price", 0),
+                            current_sl_price=max(float(coin.current_sl_price or 0), float(result.get("sl_price") or 0)),
+                            tp1_order_id=result.get("tp1_order_id"),
+                            tp2_order_id=result.get("tp2_order_id"),
+                            tp3_order_id=result.get("tp3_order_id"),
+                        )
+                p.tp1_pct, p.tp2_pct, p.tp3_pct = tp1, tp2, tp3
+                p.tp1_sell_pct, p.tp2_sell_pct, p.stop_loss_pct = s1, s2, sl_pct
+            if current == "manual":
+                cancel_result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: get_reb().cancel_tp_orders([
+                        {
+                            "symbol": c.symbol,
+                            "tp1_order_id": getattr(c, "tp1_order_id", None),
+                            "tp2_order_id": getattr(c, "tp2_order_id", None),
+                            "tp3_order_id": getattr(c, "tp3_order_id", None),
+                        }
+                        for c in p.coins
+                    ]),
+                )
+                if cancel_result.get("errors"):
+                    await query.edit_message_text(
+                        "❌ لم يتم التحويل للوضع الذكي؛ تعذر إلغاء بعض أوامر TP اليدوية.\n"
+                        "لم يتم بيع أي عملة.",
+                        reply_markup=pf_keyboard(pf_id, p.is_running),
+                    )
+                    return
                 for coin in p.coins:
-                    entry = float(coin.entry_price or 0)
-                    if entry <= 0 or (coin.position_status or "") not in ("open", "tp1_hit", "tp2_hit", "tp3_hit"):
-                        continue
-                    manual_sl = entry * (1.0 - sl_pct / 100.0)
-                    # Never loosen a previously raised/protected stop during a switch.
-                    safe_sl = max(float(coin.current_sl_price or 0), manual_sl)
                     update_coin_position(
                         db, coin.id,
-                        tp1_price=entry * (1.0 + tp1 / 100.0),
-                        tp2_price=entry * (1.0 + tp2 / 100.0),
-                        tp3_price=entry * (1.0 + tp3 / 100.0),
-                        current_sl_price=safe_sl,
+                        tp1_order_id=None, tp2_order_id=None, tp3_order_id=None,
                     )
-                    applied += 1
+            p.control_mode = "manual" if current != "manual" else "smart"
+            applied = sum(1 for c in p.coins if (c.position_status or "") in ("open", "tp1_hit", "tp2_hit", "tp3_hit")) if p.control_mode == "manual" else 0
             db.commit()
             mode_name = "يدوي (TP/SL ثابت)" if p.control_mode == "manual" else "ذكي (ATR + Trailing)"
             await query.edit_message_text(
@@ -1431,7 +1522,12 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     except Exception:
                         use_tp1, use_tp2, use_tp3, use_sl = tp1, tp2, tp3, sl_pct
                 result = reb.place_tp_orders(
-                    [{"symbol": coin.symbol, "amount": use_amt, "entry_price": entry}],
+                    [{
+                        "symbol": coin.symbol,
+                        "amount": use_amt,
+                        "entry_price": entry,
+                        "place_exchange_orders": str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual",
+                    }],
                     use_tp1, use_tp2, use_tp3, use_sl, s1, s2,
                     control_mode=getattr(p, "control_mode", "smart"),
                 )[0]
@@ -2189,7 +2285,12 @@ async def _do_start(query, tid, pf_id):
         for c in p.coins:
             amount = get_mexc().get_free_amount(c.symbol)
             price = get_mexc().get_ticker_price(f"{c.symbol}/USDT")
-            coins_data.append({"symbol": c.symbol, "amount": amount, "entry_price": price})
+            coins_data.append({
+                "symbol": c.symbol,
+                "amount": amount,
+                "entry_price": price,
+                "place_exchange_orders": str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual",
+            })
 
         tp_results = get_reb().place_tp_orders(
             coins_data, tp1, tp2, tp3, sl_pct, s1, s2,
@@ -2936,9 +3037,14 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
             return
         # Run sync CCXT work off the event loop so Telegram stays responsive
         loop = asyncio.get_event_loop()
-        actions = await loop.run_in_executor(
-            None, lambda: get_reb().check_and_manage_positions(positions)
+        reb = get_reb()
+        exchange_tp_actions = await loop.run_in_executor(
+            None, lambda: reb.sync_manual_tp_orders(positions)
         )
+        price_actions = await loop.run_in_executor(
+            None, lambda: reb.check_and_manage_positions(positions)
+        )
+        actions = exchange_tp_actions + price_actions
         trail_batches = {}  # tid -> list of meaningful trail updates
         for act in actions:
             symbol = act["symbol"]
@@ -2957,6 +3063,12 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
             pf = coin.portfolio
             tid = pf.telegram_id if pf else config.ADMIN_TELEGRAM_ID
+
+            if act["action"] == "manual_tp_order_cleared":
+                key = act.get("clear_order_key")
+                if key in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
+                    update_coin_position(db, coin.id, **{key: None})
+                continue
 
             if act["action"] == "tp_full_close":
                 remaining_before = float(coin.remaining_amount or coin.amount or 0)

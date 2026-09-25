@@ -174,6 +174,22 @@ class Rebalancer:
                 results["errors"].append({coin: str(e)})
         return results
 
+    def cancel_tp_orders(self, coins_data: List[Dict[str, Any]]) -> Dict:
+        """Cancel only TP order IDs owned by these portfolio rows."""
+        result = {"cancelled": [], "errors": []}
+        for item in coins_data:
+            symbol = item.get("symbol")
+            for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
+                order_id = item.get(key)
+                if not order_id:
+                    continue
+                try:
+                    self.client.cancel_order(order_id, f"{symbol}/{self.quote}", strict=True)
+                    result["cancelled"].append(order_id)
+                except Exception as exc:
+                    result["errors"].append({"symbol": symbol, "order_id": order_id, "error": str(exc)})
+        return result
+
     def place_tp_orders(
         self,
         coins_data: List[Dict[str, Any]],
@@ -240,6 +256,38 @@ class Rebalancer:
             tp1_price = entry * (1.0 + float(tp1_pct or 0) / 100.0) if not smart_mode and float(tp1_pct or 0) > 0 else 0.0
             tp2_price = entry * (1.0 + float(tp2_pct or 0) / 100.0) if not smart_mode and float(tp2_pct or 0) > 0 else 0.0
             tp3_price = entry * (1.0 + float(tp3_pct or 0) / 100.0) if not smart_mode and float(tp3_pct or 0) > 0 else 0.0
+            order_ids = {"tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None}
+            if not smart_mode and item.get("place_exchange_orders"):
+                sell1 = float(item.get("tp1_sell_pct_override", tp1_sell_pct) or 0)
+                sell2 = float(item.get("tp2_sell_pct_override", tp2_sell_pct) or 0)
+                if min(tp1_price, tp2_price, tp3_price) <= 0 or sell1 + sell2 >= 100.0:
+                    results.append({"symbol": symbol, "error": "invalid manual TP percentages"})
+                    continue
+                # Reserve the full position on MEXC: TP1/TP2 use the configured
+                # percentages of the original amount and TP3 receives the rest.
+                quantities = (
+                    ("tp1_order_id", amount * max(0.0, sell1) / 100.0, tp1_price),
+                    ("tp2_order_id", amount * max(0.0, sell2) / 100.0, tp2_price),
+                    ("tp3_order_id", amount * max(0.0, 100.0 - sell1 - sell2) / 100.0, tp3_price),
+                )
+                placed_ids = []
+                try:
+                    for key, qty, target in quantities:
+                        if qty <= 0 or target <= 0:
+                            continue
+                        order = self.client.create_limit_sell(symbol, qty, target)
+                        if not order or not order.get("id"):
+                            raise RuntimeError(f"{key} was not accepted by MEXC")
+                        order_ids[key] = order.get("id")
+                        placed_ids.append(order.get("id"))
+                except Exception as exc:
+                    for oid in placed_ids:
+                        try:
+                            self.client.cancel_order(oid, f"{symbol}/{self.quote}")
+                        except Exception:
+                            pass
+                    results.append({"symbol": symbol, "error": f"manual TP orders failed: {exc}"})
+                    continue
             results.append({
                 "symbol": symbol,
                 "amount": amount,
@@ -250,9 +298,9 @@ class Rebalancer:
                 "stop_loss_price": sl,
                 "sl_price": sl,
                 "original_sl_price": sl,
-                "tp1_order_id": None,
-                "tp2_order_id": None,
-                "tp3_order_id": None,
+                "tp1_order_id": order_ids["tp1_order_id"],
+                "tp2_order_id": order_ids["tp2_order_id"],
+                "tp3_order_id": order_ids["tp3_order_id"],
                 "tp_order_id": None,
                 "mode": "smart" if smart_mode else "manual",
                 "trail_pct": DEFAULT_TRAIL_PCT,
@@ -262,6 +310,53 @@ class Rebalancer:
                 "error": None,
             })
         return results
+
+    def sync_manual_tp_orders(self, positions: List[Any]) -> List[Dict]:
+        """Return TP actions only after MEXC reports a manual limit fill."""
+        actions = []
+        for coin in positions:
+            portfolio = getattr(coin, "portfolio", None)
+            if str(getattr(portfolio, "control_mode", "smart") or "smart").lower() != "manual":
+                continue
+            status = str(getattr(coin, "position_status", "open") or "open")
+            if status == "open":
+                stage, key, fallback_pct, fallback_price = "tp1", "tp1_order_id", 40.0, coin.tp1_price
+            elif status == "tp1_hit":
+                stage, key, fallback_pct, fallback_price = "tp2", "tp2_order_id", 30.0, coin.tp2_price
+            elif status == "tp2_hit":
+                stage, key, fallback_pct, fallback_price = "tp3", "tp3_order_id", 30.0, coin.tp3_price
+            else:
+                continue
+            order_id = getattr(coin, key, None)
+            if not order_id:
+                continue
+            order = self.client.fetch_order(order_id, coin.symbol)
+            order_status = str((order or {}).get("status") or "").lower()
+            if order_status in ("canceled", "cancelled", "rejected", "expired"):
+                # Let the normal manual monitor take over on the next line;
+                # the DB cleanup is persisted by the monitor job.
+                setattr(coin, key, None)
+                actions.append({
+                    "coin_id": getattr(coin, "id", None), "symbol": coin.symbol,
+                    "action": "manual_tp_order_cleared", "clear_order_key": key,
+                })
+                continue
+            if order_status not in ("closed", "filled"):
+                continue
+            remaining = float(coin.remaining_amount or coin.amount or 0)
+            original = float(coin.amount or remaining or 0)
+            filled = float((order or {}).get("filled") or 0)
+            if filled <= 0:
+                filled = min(remaining, original * fallback_pct / 100.0)
+            price = float((order or {}).get("average") or (order or {}).get("price") or fallback_price or 0)
+            actions.append({
+                "coin_id": getattr(coin, "id", None), "symbol": coin.symbol,
+                "action": f"{stage}_hit", "price": price, "fill_price": price,
+                "filled_amount": min(remaining, filled),
+                "new_sl": float(coin.current_sl_price or 0),
+                "exchange_order": True,
+            })
+        return actions
 
     def check_and_manage_positions(self, positions: List[Any]) -> List[Dict]:
         """وقف متحرك + إعادة دخول متكررة (بدون أهداف ثابتة).
@@ -365,12 +460,17 @@ class Rebalancer:
                 continue
 
             # ----- ضرب الاستوب → بيع -----
+            control_mode = str(
+                getattr(getattr(coin, "portfolio", None), "control_mode", "smart") or "smart"
+            ).lower()
             if sl > 0 and price <= sl:
                 sold = False
                 dust = False
                 amount = free_amt * 0.998 if free_amt > 0 else remaining * 0.998
                 if amount > 0 and amount * price >= MIN_POSITION_USDT:
                     try:
+                        if control_mode == "manual":
+                            self.client.cancel_all_open_sells(symbol)
                         self.client.create_market_order(
                             f"{symbol}/{self.quote}", "sell", amount
                         )
@@ -411,10 +511,11 @@ class Rebalancer:
 
             # ----- الوضع اليدوي: أهداف ثابتة + وقف ثابت -----
             # لا نخلط هذا المسار مع التريلينج الذكي حتى لا تتغير أهداف المستخدم.
-            control_mode = str(
-                getattr(getattr(coin, "portfolio", None), "control_mode", "smart") or "smart"
-            ).lower()
             if control_mode == "manual":
+                # Once exchange limit orders exist, the exchange is the sole
+                # TP executor; the sync method above records fills.
+                if any(getattr(coin, key, None) for key in ("tp1_order_id", "tp2_order_id", "tp3_order_id")):
+                    continue
                 base_amount = float(coin.amount or remaining or 0)
                 portfolio = getattr(coin, "portfolio", None)
                 tp1_sell_pct = float(getattr(portfolio, "tp1_sell_pct", None) or 40.0)
@@ -534,7 +635,12 @@ class Rebalancer:
             except Exception as e:
                 logger.warning("smart levels failed on reentry %s: %s", symbol, e)
         placed = self.place_tp_orders(
-            [{"symbol": symbol, "amount": amount, "entry_price": entry}],
+            [{
+                "symbol": symbol,
+                "amount": amount,
+                "entry_price": entry,
+                "place_exchange_orders": str(control_mode or "smart").lower() == "manual",
+            }],
             tp1_pct, tp2_pct, tp3_pct, stop_loss_pct, tp1_sell_pct, tp2_sell_pct,
             control_mode=control_mode,
         )
