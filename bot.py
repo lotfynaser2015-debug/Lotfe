@@ -1035,6 +1035,101 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _do_close(query, tid, int(data.split("_")[2]))
         return
 
+    # ——— أزرار التحكم داخل المحفظة ———
+    if data.startswith("toggle_"):
+        pf_id = int(data.split("_")[1])
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, pf_id, tid)
+            if not p:
+                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+                return
+            if p.is_running:
+                await _do_stop(query, tid, pf_id)
+            else:
+                await _do_start(query, tid, pf_id)
+        finally:
+            db.close()
+        return
+
+    if data.startswith("rebuild_"):
+        pf_id = int(data.split("_")[1])
+        await _do_rebuild_positions(query, tid, pf_id)
+        return
+
+    if data.startswith("refresh_tp_"):
+        pf_id = int(data.split("_")[1])
+        await _do_refresh_tpsl(query, tid, pf_id)
+        return
+
+    if data.startswith("stats_"):
+        pf_id = int(data.split("_")[1])
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, pf_id, tid)
+            if not p:
+                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+                return
+            events = []
+            try:
+                events = get_portfolio_trade_events(db, p.id, tid) or []
+            except Exception:
+                events = []
+            prices = {}
+            symbols = [c.symbol for c in p.coins]
+            if symbols:
+                try:
+                    prices = get_mexc().get_all_prices(symbols) or {}
+                except Exception:
+                    prices = {}
+            await query.edit_message_text(
+                format_portfolio_stats(p, events, prices),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
+
+    # فحص الناقص — الزر يبعت check_missing_ أو missing_
+    if data.startswith("check_missing_") or (data.startswith("missing_") and not data.startswith("missing_toggle_") and not data.startswith("missing_confirm_")):
+        # check_missing_12  أو  missing_12
+        parts = data.split("_")
+        pf_id = int(parts[-1])
+        await _show_missing_reentry(query, context, tid, pf_id)
+        return
+
+    if data.startswith("missing_toggle_"):
+        # missing_toggle_{pf_id}_{SYMBOL}
+        rest = data[len("missing_toggle_"):]
+        pf_id_str, symbol = rest.split("_", 1)
+        await _show_missing_reentry(query, context, tid, int(pf_id_str), toggle_symbol=symbol)
+        return
+
+    if data.startswith("missing_confirm_"):
+        pf_id = int(data.split("_")[-1])
+        await _do_missing_reentry(query, context, tid, pf_id)
+        return
+
+    # حذف المحفظة — الزر يبعت delete_pf_
+    if data.startswith("delete_pf_"):
+        pf_id = int(data.split("_")[-1])
+        await query.edit_message_text(
+            "⚠️ هل أنت متأكد من حذف المحفظة؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ نعم، احذفها", callback_data=f"confirm_close_{pf_id}")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data=f"view_{pf_id}")],
+            ]),
+        )
+        return
+
+    # أهداف المحفظة (من زر التفاصيل الداخلي إن وُجد)
+    if data.startswith("pf_tpsl_") and data.count("_") == 2:
+        # already handled above as pf_tpsl_
+        pass
+
 
 async def _do_rebuild_positions(query, tid, pf_id):
     """دورة كاملة داخل المحفظة:
