@@ -1445,7 +1445,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
 
 
 async def _do_refresh_tpsl(query, tid, pf_id):
-    """Replace TP orders and the monitored SL without selling (smart levels per coin)."""
+    """تحويل المراكز المفتوحة لنظام الوقف المتحرك بدون أي بيع."""
     import asyncio
     import time as _time
 
@@ -1457,7 +1457,8 @@ async def _do_refresh_tpsl(query, tid, pf_id):
             return
         if not p.is_running:
             await query.edit_message_text(
-                "المحفظة متوقفة؛ شغّلها أولاً حتى يتم تحديث أوامر الأهداف.",
+                "المحفظة متوقفة؛ شغّلها أولاً ثم اضغط *تحديث الأهداف*.",
+                parse_mode="Markdown",
                 reply_markup=pf_keyboard(pf_id, False),
             )
             return
@@ -1471,42 +1472,37 @@ async def _do_refresh_tpsl(query, tid, pf_id):
                 return float(user_val)
             return default
 
-        # Fallback % if smart analysis has no candles
-        fb_tp1 = pct(getattr(p, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
-        fb_tp2 = pct(getattr(p, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
-        fb_tp3 = pct(getattr(p, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
-        s1 = pct(getattr(p, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
-        s2 = pct(getattr(p, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
         fb_sl = pct(getattr(p, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
 
         await query.edit_message_text(
-            "⏳ جاري حساب الأهداف الذكية وتحديث الأوامر بدون بيع...\n"
-            "قد يستغرق الأمر دقيقة للمحافظ الكبيرة."
+            "⏳ جاري تحويل المحفظة لنظام *الوقف المتحرك*...\n"
+            "إلغاء أوامر الأهداف القديمة + ضبط الاستوب — بدون بيع.",
+            parse_mode="Markdown",
         )
+
         updated = []
         details = []
         errors = []
         reb = get_reb()
+        client = get_mexc()
+
+        symbols = [c.symbol for c in p.coins]
+        try:
+            prices = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: client.get_all_prices(symbols) or {}
+            )
+        except Exception:
+            prices = {}
 
         for coin in p.coins:
-            if coin.position_status not in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
+            status = (coin.position_status or "idle")
+            if status not in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
                 continue
             amount = float(coin.remaining_amount or coin.amount or 0)
             entry = float(coin.entry_price or 0)
             if amount <= 0 or entry <= 0:
                 continue
             try:
-                # Smart levels from coin behaviour (ATR + trend)
-                levels = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda c=coin, e=entry: reb.build_smart_levels_for_entry(
-                        c.symbol, e, fb_tp1, fb_tp2, fb_tp3, fb_sl, "1h",
-                    ),
-                )
-                tp1, tp2, tp3, sl_pct = (
-                    levels.tp1_pct, levels.tp2_pct, levels.tp3_pct, levels.stop_loss_pct,
-                )
-
                 reb.cancel_tp_orders([{
                     "symbol": coin.symbol,
                     "tp_order_id": getattr(coin, "tp_order_id", None),
@@ -1514,79 +1510,102 @@ async def _do_refresh_tpsl(query, tid, pf_id):
                     "tp2_order_id": getattr(coin, "tp2_order_id", None),
                     "tp3_order_id": getattr(coin, "tp3_order_id", None),
                 }])
-                skipped = []
-                if coin.position_status in ("tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
-                    skipped.append("tp1")
-                if coin.position_status in ("tp2_hit", "tp3_hit", "tp_hit"):
-                    skipped.append("tp2")
-                if coin.position_status in ("tp3_hit", "tp_hit"):
-                    skipped.append("tp3")
 
                 result = reb.place_tp_orders(
                     [{
                         "symbol": coin.symbol,
                         "amount": amount,
                         "entry_price": entry,
+                        "tp1_order_id": getattr(coin, "tp1_order_id", None),
+                        "tp2_order_id": getattr(coin, "tp2_order_id", None),
+                        "tp3_order_id": getattr(coin, "tp3_order_id", None),
                     }],
-                    tp1, tp2, tp3, sl_pct, s1, s2, skip_stages=skipped,
+                    0, 0, 0, fb_sl, 0, 0,
                 )[0]
                 if result.get("error"):
                     errors.append(f"{coin.symbol}: {result['error']}")
                     continue
 
-                # SL policy by stage (never pin SL to current TP price)
-                if coin.position_status == "open":
-                    new_sl = result.get("sl_price", 0)
-                elif coin.position_status == "tp1_hit":
-                    new_sl = entry
-                elif coin.position_status == "tp2_hit":
-                    # Protect at TP1 level, not TP2
-                    new_sl = float(result.get("tp1_price") or coin.tp1_price or entry)
-                    if new_sl < entry:
-                        new_sl = entry
-                else:
-                    new_sl = float(result.get("tp2_price") or coin.tp2_price or entry)
+                new_sl = float(result.get("sl_price") or result.get("stop_loss_price") or 0)
+                price = float(prices.get(coin.symbol) or prices.get(f"{coin.symbol}/USDT") or 0)
+                if price <= 0:
+                    try:
+                        price = float(client.get_ticker_price(f"{coin.symbol}/{client.quote}") or 0)
+                    except Exception:
+                        price = 0
+
+                if price > 0 and entry > 0:
+                    gain_pct = ((price / entry) - 1.0) * 100.0
+                    from rebalancer import (
+                        DEFAULT_TRAIL_PCT, BE_LOCK_PCT, PUMP_GAIN_PCT, PUMP_TRAIL_PCT,
+                        PUMP_STRONG_GAIN_PCT, PUMP_STRONG_TRAIL_PCT,
+                    )
+                    if gain_pct >= PUMP_STRONG_GAIN_PCT:
+                        trail_pct = PUMP_STRONG_TRAIL_PCT
+                    elif gain_pct >= PUMP_GAIN_PCT:
+                        trail_pct = PUMP_TRAIL_PCT
+                    else:
+                        trail_pct = DEFAULT_TRAIL_PCT
+                    candidate = price * (1.0 - trail_pct / 100.0)
+                    if gain_pct >= BE_LOCK_PCT:
+                        candidate = max(candidate, entry)
+                    if candidate > new_sl:
+                        new_sl = candidate
 
                 update_coin_position(
                     db,
                     coin.id,
-                    tp1_price=result.get("tp1_price", coin.tp1_price),
-                    tp2_price=result.get("tp2_price", coin.tp2_price),
-                    tp3_price=result.get("tp3_price", coin.tp3_price),
-                    tp_price=result.get("tp1_price", coin.tp1_price),
+                    position_status="open",
+                    tp1_price=0.0,
+                    tp2_price=0.0,
+                    tp3_price=0.0,
+                    tp_price=0.0,
                     current_sl_price=new_sl,
-                    original_sl_price=coin.original_sl_price or result.get("original_sl_price", 0),
-                    tp1_order_id=result.get("tp1_order_id"),
-                    tp2_order_id=result.get("tp2_order_id"),
-                    tp3_order_id=result.get("tp3_order_id"),
+                    original_sl_price=result.get("original_sl_price") or new_sl,
+                    tp1_order_id=None,
+                    tp2_order_id=None,
+                    tp3_order_id=None,
+                    tp_order_id=None,
                 )
                 updated.append(coin.symbol)
-                details.append(
-                    f"`{coin.symbol}` TP1 {tp1:.1f}% / TP2 {tp2:.1f}% / "
-                    f"TP3 {tp3:.1f}% / SL {sl_pct:.1f}% ({levels.reason})"
-                )
-                _time.sleep(0.35)  # gentle on API with many coins
+                gain_txt = ""
+                if price > 0 and entry > 0:
+                    g = ((price / entry) - 1.0) * 100.0
+                    gain_txt = f" | ربح `{g:+.1f}%`"
+                details.append(f"`{coin.symbol}` SL `{new_sl:.6g}`{gain_txt}")
+                _time.sleep(0.25)
             except Exception as exc:
                 errors.append(f"{coin.symbol}: {exc}")
 
         log_action(
             db, tid, "refresh_tpsl",
-            f"Smart TP/SL for {p.name}: {', '.join(updated) or 'none'}",
+            f"Trailing migrate {p.name}: {', '.join(updated) or 'none'}",
             not errors, pf_id,
         )
         lines = [
-            f"✅ تم تحديث الأهداف الذكية لمحفظة *{p.name}*",
+            f"✅ *تم التحويل للوقف المتحرك* — محفظة *{p.name}*",
             "لم يتم بيع أي عملة.",
-            "كل عملة حصلت على أهداف حسب سلوكها (ATR + اتجاه).",
+            "اتلغت أوامر الأهداف القديمة واتظبط الاستوب المتحرك.",
+            f"تم تحديث: *{len(updated)}* عملة",
         ]
         if details:
-            lines.append("\n" + "\n".join(details[:25]))
-            if len(details) > 25:
-                lines.append(f"... و {len(details) - 25} عملة أخرى")
+            lines.append("")
+            lines.extend(details[:20])
+            if len(details) > 20:
+                lines.append(f"... و {len(details) - 20} أخرى")
         if errors:
-            lines.append("\n⚠️ ملاحظات:\n" + "\n".join(f"• {x}" for x in errors[:15]))
+            lines.append("")
+            lines.append("⚠️ ملاحظات:")
+            lines.extend(f"• {e}" for e in errors[:10])
         await query.edit_message_text(
             "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=pf_keyboard(pf_id, True),
+        )
+    except Exception as e:
+        logger.exception("refresh trailing migrate failed")
+        await query.edit_message_text(
+            f"⚠️ فشل التحديث: `{e}`",
             parse_mode="Markdown",
             reply_markup=pf_keyboard(pf_id, True),
         )
@@ -2838,6 +2857,7 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
         actions = await loop.run_in_executor(
             None, lambda: get_reb().check_and_manage_positions(positions)
         )
+        trail_batches = {}  # tid -> list of meaningful trail updates
         for act in actions:
             symbol = act["symbol"]
             coin_id = act.get("coin_id")
@@ -3043,23 +3063,22 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 if new_sl <= old_sl:
                     continue
                 update_coin_position(db, coin.id, current_sl_price=new_sl)
-                mode = act.get("mode") or "trail"
-                mode_ar = {"trail": "متحرك", "pump": "بامب", "pump_strong": "بامب قوي"}.get(mode, mode)
-                gain = act.get("gain_pct")
-                trail_pct = act.get("trail_pct")
-                gain_txt = f"\nالربح من الدخول: `+{float(gain):.1f}%`" if gain is not None else ""
-                trail_txt = f" | مسافة `{float(trail_pct):.1f}%`" if trail_pct else ""
-                msg = (
-                    f"📈 *وقف متحرك ({mode_ar})* — `{symbol}`\n"
-                    f"السعر: `{act['price']:.6g}`{gain_txt}\n"
-                    f"الاستوب: `{old_sl:.6g}` → `{new_sl:.6g}`{trail_txt}\n"
-                    f"المحفظة: *{pf.name if pf else '—'}*"
-                )
-                try:
-                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
-                except Exception:
-                    pass
-
+                # إشعار فقط عند رفع معتبر (≥0.4%) أو قفل رأس المال
+                move_pct = ((new_sl / old_sl) - 1.0) * 100.0 if old_sl > 0 else 100.0
+                gain = float(act.get("gain_pct") or 0)
+                entry = float(coin.entry_price or 0)
+                be_lock = gain >= 1.2 and entry > 0 and old_sl < entry * 0.999
+                if move_pct < 0.4 and not be_lock:
+                    continue
+                trail_batches.setdefault(tid, []).append({
+                    "symbol": symbol,
+                    "old_sl": old_sl,
+                    "new_sl": new_sl,
+                    "price": act.get("price"),
+                    "gain": gain,
+                    "pf": pf.name if pf else "—",
+                    "be_lock": be_lock,
+                })
             elif act["action"] == "tp3_hit":
                 remaining_before = float(coin.remaining_amount or coin.amount or 0)
                 filled_amount = float(act.get("filled_amount") or remaining_before)
@@ -3258,6 +3277,25 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception:
                     pass
+        # إشعارات الـ trailing المجمّعة (رسالة واحدة لكل مستخدم)
+        for _tid, items in trail_batches.items():
+            if not items:
+                continue
+            lines = [f"📈 *تحديث وقف متحرك* ({len(items)})", ""]
+            for it in items[:25]:
+                g = it.get("gain")
+                gtxt = f" | `+{g:.1f}%`" if g is not None else ""
+                be = " 🔒" if it.get("be_lock") else ""
+                lines.append(
+                    f"`{it['symbol']}`{be}: `{it['old_sl']:.6g}` → `{it['new_sl']:.6g}`{gtxt}"
+                )
+            if len(items) > 25:
+                lines.append(f"... و {len(items) - 25} أخرى")
+            try:
+                await context.bot.send_message(_tid, "\n".join(lines), parse_mode="Markdown")
+            except Exception:
+                pass
+
     except Exception:
         logger.exception("monitor_positions_job error")
     finally:
@@ -3279,7 +3317,7 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(
             monitor_positions_job,
-            interval=45,
+            interval=60,
             first=15,
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
         )
