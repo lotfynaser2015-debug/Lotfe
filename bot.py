@@ -3067,7 +3067,7 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 move_pct = ((new_sl / old_sl) - 1.0) * 100.0 if old_sl > 0 else 100.0
                 gain = float(act.get("gain_pct") or 0)
                 entry = float(coin.entry_price or 0)
-                be_lock = gain >= 1.2 and entry > 0 and old_sl < entry * 0.999
+                be_lock = gain >= 4.0 and entry > 0 and old_sl < entry * 0.999
                 if move_pct < 0.4 and not be_lock:
                     continue
                 trail_batches.setdefault(tid, []).append({

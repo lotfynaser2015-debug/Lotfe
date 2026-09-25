@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # الاستوب الابتدائي تحت الدخول
 INITIAL_SL_PCT = 3.0
 # بعد ربح بهذا القدر → الاستوب على سعر الدخول (break-even)
-BE_LOCK_PCT = 1.2
+BE_LOCK_PCT = 4.0
 # مسافة الـ trailing الافتراضية تحت السعر الحالي
 DEFAULT_TRAIL_PCT = 2.0
 # عند ربح قوي: مسافة أوسع عشان مايتقفلش بدري
