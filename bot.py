@@ -159,17 +159,64 @@ def _missing_reentry_keyboard(pf_id: int, missing_symbols, selected, allow_selec
     return InlineKeyboardMarkup(rows)
 
 
-def format_pf(p, current_value: float = None) -> str:
-    """عرض محفظة: حالة + قيمة + عملات."""
+def format_pf(p, current_value: float = None, prices: dict = None, events=None) -> str:
+    """عرض محفظة بربح/خسارة حقيقية (من سعر الدخول + المحقق).
+
+    مش بيقارن قيمة الباقي بالمخصص الأصلي — ده كان بيظهر خسارة وهمية بعد البيع.
+    """
     status = "🟢 شغالة" if p.is_running else "⚪ متوقفة"
     allocated = float(p.investment_usdt or 0)
+    prices = prices or {}
+    events = events or []
 
-    pnl_line = ""
-    if current_value is not None and allocated > 0:
-        pnl = current_value - allocated
-        pct = (pnl / allocated) * 100
-        emoji = "🟢" if pnl >= 0 else "🔴"
-        pnl_line = f"{emoji} الربح/الخسارة: *{pnl:+.2f}* USDT (*{pct:+.2f}%*)"
+    # --- مراكز مفتوحة: تكلفة الدخول vs القيمة الحالية ---
+    open_cost = 0.0
+    open_value = 0.0
+    open_count = 0
+    for coin in p.coins:
+        status_c = (coin.position_status or "idle")
+        if status_c not in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
+            # لو لسه فيه كمية متبقية نعتبرها مفتوحة
+            rem = float(coin.remaining_amount or coin.amount or 0)
+            entry = float(coin.entry_price or 0)
+            if rem <= 0 or entry <= 0:
+                continue
+        else:
+            rem = float(coin.remaining_amount or coin.amount or 0)
+            entry = float(coin.entry_price or 0)
+            if rem <= 0 or entry <= 0:
+                continue
+        px = float(prices.get(coin.symbol) or 0)
+        if px <= 0 and current_value is not None:
+            # prices dict may be incomplete
+            pass
+        if px <= 0:
+            px = entry
+        open_cost += entry * rem
+        open_value += px * rem
+        open_count += 1
+
+    # لو current_value اتبعت من المنصة (رصيد فعلي) استخدمه للقيمة
+    if current_value is not None and current_value >= 0:
+        # استخدم الرصيد الفعلي كقيمة، والتكلفة من الدخول للكمية المتبقية
+        if open_cost > 0:
+            open_value = float(current_value)
+        elif float(current_value or 0) > 0 and open_cost <= 0:
+            open_value = float(current_value)
+
+    unrealized = open_value - open_cost if open_cost > 0 else 0.0
+    unrealized_pct = ((open_value / open_cost) - 1.0) * 100.0 if open_cost > 0 else 0.0
+
+    realized = sum(float(getattr(e, "realized_pnl", 0) or 0) for e in events)
+    total_pnl = realized + unrealized
+    total_basis = open_cost + abs(min(realized, 0))  # rough
+    # نسبة الإجمالي على المخصص فقط لو لسه في مراكز أو في محقق
+    if open_cost > 0:
+        total_pct = (total_pnl / open_cost) * 100.0
+    elif allocated > 0 and (realized != 0 or open_value > 0):
+        total_pct = (total_pnl / allocated) * 100.0
+    else:
+        total_pct = 0.0
 
     symbols = [c.symbol for c in p.coins]
     if symbols:
@@ -186,12 +233,31 @@ def format_pf(p, current_value: float = None) -> str:
         f"📁 *{p.name}*  `#{p.id}`",
         "━━━━━━━━━━━━━━━━━━━━",
         f"الحالة: *{status}*",
-        f"المخصص: *{allocated:.2f}* USDT",
+        f"المخصص الأصلي: *{allocated:.2f}* USDT",
     ]
-    if current_value is not None:
-        out.append(f"القيمة الحالية: *{current_value:.2f}* USDT")
-    if pnl_line:
-        out.append(pnl_line)
+    out.append(f"قيمة المراكز المفتوحة: *{open_value:.2f}* USDT")
+    if open_cost > 0:
+        out.append(f"تكلفة الدخول (المتبقي): *{open_cost:.2f}* USDT")
+
+    u_emoji = "🟢" if unrealized >= 0 else "🔴"
+    r_emoji = "🟢" if realized >= 0 else "🔴"
+    t_emoji = "🟢" if total_pnl >= 0 else "🔴"
+
+    if open_cost > 0 or open_count > 0:
+        out.append(
+            f"{u_emoji} غير المحقق: *{unrealized:+.2f}* USDT (*{unrealized_pct:+.2f}%*)"
+        )
+    if events:
+        out.append(f"{r_emoji} المحقق: *{realized:+.2f}* USDT")
+        out.append(f"{t_emoji} *الإجمالي: {total_pnl:+.2f} USDT*")
+    elif open_cost > 0:
+        out.append(
+            f"{t_emoji} الربح/الخسارة: *{unrealized:+.2f}* USDT (*{unrealized_pct:+.2f}%*)"
+        )
+    elif current_value is not None and allocated > 0 and open_value < 1.0:
+        # مفيش مراكز مفتوحة تقريبًا — المخصص اتحول لسيولة بعد البيع
+        out.append("_المراكز مغلقة/مباعة — راجع الإحصائيات للمحقق_")
+
     out.append("")
     out.append(f"*العملات* ({len(symbols)})")
     out.append(coins_block)
@@ -796,14 +862,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             coins = [c.symbol for c in p.coins]
             current_value = None
+            prices = {}
             if coins:
                 try:
                     val = get_mexc().get_coins_value(coins)
                     current_value = float(val.get("total_usdt") or 0)
+                    assets = val.get("assets") or {}
+                    for sym, row in assets.items():
+                        try:
+                            prices[sym] = float(row.get("price") or 0)
+                        except Exception:
+                            pass
                 except Exception:
                     current_value = None
+                if not prices:
+                    try:
+                        prices = get_mexc().get_all_prices(coins) or {}
+                    except Exception:
+                        prices = {}
+            events = []
+            try:
+                events = get_portfolio_trade_events(db, p.id, tid) or []
+            except Exception:
+                events = []
             await query.edit_message_text(
-                format_pf(p, current_value=current_value),
+                format_pf(p, current_value=current_value, prices=prices, events=events),
                 parse_mode="Markdown",
                 reply_markup=pf_keyboard(
                     p.id, p.is_running,
