@@ -184,13 +184,17 @@ class Rebalancer:
         tp1_sell_pct: float = 0.0,
         tp2_sell_pct: float = 0.0,
         skip_stages: Optional[List[str]] = None,
+        control_mode: str = "smart",
     ) -> List[Dict]:
-        """تهيئة وقف متحرك فقط — بدون أوامر أهداف ثابتة على المنصة.
+        """تهيئة إدارة المركز حسب الوضع المحدد.
 
-        - يلغي أي أوامر TP قديمة إن وُجدت
-        - يحسب استوب ابتدائي تحت الدخول (INITIAL_SL_PCT أو stop_loss_pct)
-        - الإدارة الفعلية تتم في check_and_manage_positions (رفع الاستوب مع السعر)
+        - smart: وقف متحرك تكيفي، بدون أهداف ثابتة.
+        - manual: أهداف TP1/TP2/TP3 ووقف يدوي تتم مراقبتها من البوت.
+        لا نضع أوامر limit إضافية على المنصة لأن monitor_positions_job هو
+        المسؤول عن تسجيل التنفيذ وتحديث الكمية؛ وضع أوامر limit هنا كان
+        يسبب احتمال بيع مزدوج.
         """
+        smart_mode = str(control_mode or "smart").lower() != "manual"
         results = []
         sl_pct = float(stop_loss_pct) if stop_loss_pct and float(stop_loss_pct) > 0 else INITIAL_SL_PCT
         for item in coins_data:
@@ -217,29 +221,32 @@ class Rebalancer:
                     except Exception:
                         pass
 
-            # استوب ابتدائي — يُرفع لاحقاً بالـ trailing
-            try:
-                levels = self.build_smart_levels_for_entry(
-                    symbol, entry,
-                    fallback_tp1=3.0, fallback_tp2=5.0, fallback_tp3=8.0,
-                    fallback_sl=sl_pct,
-                )
-                smart_sl = float(getattr(levels, "stop_loss_pct", 0) or 0)
-                if smart_sl > 0:
-                    sl_pct_use = min(max(smart_sl, 1.5), 6.0)
-                else:
-                    sl_pct_use = sl_pct
-            except Exception:
-                sl_pct_use = sl_pct
+            # الاستوب اليدوي يظل كما أدخله المستخدم؛ الذكي فقط يكيف مسافته.
+            sl_pct_use = sl_pct
+            if smart_mode:
+                try:
+                    levels = self.build_smart_levels_for_entry(
+                        symbol, entry,
+                        fallback_tp1=3.0, fallback_tp2=5.0, fallback_tp3=8.0,
+                        fallback_sl=sl_pct,
+                    )
+                    smart_sl = float(getattr(levels, "stop_loss_pct", 0) or 0)
+                    if smart_sl > 0:
+                        sl_pct_use = min(max(smart_sl, 1.5), 6.0)
+                except Exception:
+                    pass
 
             sl = entry * (1.0 - sl_pct_use / 100.0)
+            tp1_price = entry * (1.0 + float(tp1_pct or 0) / 100.0) if not smart_mode and float(tp1_pct or 0) > 0 else 0.0
+            tp2_price = entry * (1.0 + float(tp2_pct or 0) / 100.0) if not smart_mode and float(tp2_pct or 0) > 0 else 0.0
+            tp3_price = entry * (1.0 + float(tp3_pct or 0) / 100.0) if not smart_mode and float(tp3_pct or 0) > 0 else 0.0
             results.append({
                 "symbol": symbol,
                 "amount": amount,
                 "entry_price": entry,
-                "tp1_price": 0.0,
-                "tp2_price": 0.0,
-                "tp3_price": 0.0,
+                "tp1_price": tp1_price,
+                "tp2_price": tp2_price,
+                "tp3_price": tp3_price,
                 "stop_loss_price": sl,
                 "sl_price": sl,
                 "original_sl_price": sl,
@@ -247,9 +254,11 @@ class Rebalancer:
                 "tp2_order_id": None,
                 "tp3_order_id": None,
                 "tp_order_id": None,
-                "mode": "trailing_only",
+                "mode": "smart" if smart_mode else "manual",
                 "trail_pct": DEFAULT_TRAIL_PCT,
                 "sl_pct": sl_pct_use,
+                "tp1_sell_pct": float(tp1_sell_pct or 0),
+                "tp2_sell_pct": float(tp2_sell_pct or 0),
                 "error": None,
             })
         return results
@@ -400,6 +409,43 @@ class Rebalancer:
                 })
                 continue
 
+            # ----- الوضع اليدوي: أهداف ثابتة + وقف ثابت -----
+            # لا نخلط هذا المسار مع التريلينج الذكي حتى لا تتغير أهداف المستخدم.
+            control_mode = str(
+                getattr(getattr(coin, "portfolio", None), "control_mode", "smart") or "smart"
+            ).lower()
+            if control_mode == "manual":
+                base_amount = float(coin.amount or remaining or 0)
+                portfolio = getattr(coin, "portfolio", None)
+                tp1_sell_pct = float(getattr(portfolio, "tp1_sell_pct", None) or 40.0)
+                tp2_sell_pct = float(getattr(portfolio, "tp2_sell_pct", None) or 30.0)
+                if status == "open" and float(coin.tp1_price or 0) > 0 and price >= float(coin.tp1_price):
+                    filled = min(remaining, base_amount * max(0.0, tp1_sell_pct) / 100.0)
+                    if filled <= 0:
+                        filled = min(remaining, base_amount * 0.40)
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None), "symbol": symbol,
+                        "action": "tp1_hit", "price": price, "fill_price": price,
+                        "filled_amount": filled,
+                    })
+                elif status in ("open", "tp1_hit") and float(coin.tp2_price or 0) > 0 and price >= float(coin.tp2_price):
+                    filled = min(remaining, base_amount * max(0.0, tp2_sell_pct) / 100.0)
+                    if filled <= 0:
+                        filled = min(remaining, base_amount * 0.30)
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None), "symbol": symbol,
+                        "action": "tp2_hit", "price": price, "fill_price": price,
+                        "filled_amount": filled, "new_sl": max(sl, entry),
+                    })
+                elif status in ("open", "tp1_hit", "tp2_hit") and float(coin.tp3_price or 0) > 0 and price >= float(coin.tp3_price):
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None), "symbol": symbol,
+                        "action": "tp3_hit", "price": price, "fill_price": price,
+                        "filled_amount": remaining,
+                    })
+                # Manual mode never falls through to the adaptive trailing logic.
+                continue
+
             # ----- Trailing: ارفع الاستوب مع السعر -----
             if entry <= 0:
                 continue
@@ -461,6 +507,7 @@ class Rebalancer:
         tp1_sell_pct: float = 40.0,
         tp2_sell_pct: float = 30.0,
         use_smart: bool = True,
+        control_mode: str = "smart",
     ) -> Dict:
         """Market buy then place multi-TP limits for a re-entry (smart levels by default)."""
         result = {"symbol": symbol, "error": None}
@@ -474,7 +521,7 @@ class Rebalancer:
         time.sleep(1.0)
         amount = self.client.get_free_amount(symbol) * 0.998
         entry = self.client.get_ticker_price(f"{symbol}/{self.quote}")
-        if use_smart and entry > 0:
+        if use_smart and str(control_mode or "smart").lower() != "manual" and entry > 0:
             try:
                 levels = self.build_smart_levels_for_entry(
                     symbol, entry, tp1_pct, tp2_pct, tp3_pct, stop_loss_pct,
@@ -489,6 +536,7 @@ class Rebalancer:
         placed = self.place_tp_orders(
             [{"symbol": symbol, "amount": amount, "entry_price": entry}],
             tp1_pct, tp2_pct, tp3_pct, stop_loss_pct, tp1_sell_pct, tp2_sell_pct,
+            control_mode=control_mode,
         )
         if placed:
             result.update(placed[0])

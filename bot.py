@@ -119,6 +119,7 @@ def pf_keyboard(pf_id: int, is_running: bool):
             InlineKeyboardButton("💰 زيادة المبلغ", callback_data=f"increase_{pf_id}"),
             InlineKeyboardButton("🔄 تحديث الأهداف", callback_data=f"refresh_tp_{pf_id}"),
         ],
+        [InlineKeyboardButton("🧠/✍️ وضع التحكم", callback_data=f"mode_{pf_id}")],
         [
             InlineKeyboardButton("🔎 فحص الناقص", callback_data=f"check_missing_{pf_id}"),
             InlineKeyboardButton("📊 إحصائيات", callback_data=f"stats_{pf_id}"),
@@ -165,6 +166,7 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
     مش بيقارن قيمة الباقي بالمخصص الأصلي — ده كان بيظهر خسارة وهمية بعد البيع.
     """
     status = "🟢 شغالة" if p.is_running else "⚪ متوقفة"
+    mode = "يدوي: أهداف + وقف ثابت" if str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual" else "ذكي: مستويات + وقف متحرك"
     allocated = float(p.investment_usdt or 0)
     prices = prices or {}
     events = events or []
@@ -233,6 +235,7 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
         f"📁 *{p.name}*  `#{p.id}`",
         "━━━━━━━━━━━━━━━━━━━━",
         f"الحالة: *{status}*",
+        f"التحكم: *{mode}*",
         f"المخصص الأصلي: *{allocated:.2f}* USDT",
     ]
     out.append(f"قيمة المراكز المفتوحة: *{open_value:.2f}* USDT")
@@ -1035,6 +1038,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _do_close(query, tid, int(data.split("_")[2]))
         return
 
+    # ——— اختيار وضع التحكم داخل المحفظة ———
+    if data.startswith("mode_"):
+        pf_id = int(data.split("_")[1])
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, pf_id, tid)
+            if not p:
+                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+                return
+            if p.is_running:
+                await query.edit_message_text(
+                    "⚠️ أوقف المحفظة أولاً قبل تغيير وضع التحكم، ثم أعد بناء المراكز.",
+                    reply_markup=pf_keyboard(pf_id, True),
+                )
+                return
+            current = str(getattr(p, "control_mode", "smart") or "smart").lower()
+            p.control_mode = "manual" if current != "manual" else "smart"
+            db.commit()
+            mode_name = "يدوي (TP/SL ثابت)" if p.control_mode == "manual" else "ذكي (ATR + Trailing)"
+            await query.edit_message_text(
+                f"✅ تم اختيار وضع: *{mode_name}*\n\n"
+                "أعد تشغيل المحفظة أو استخدم إعادة بناء المراكز لتطبيق الوضع على المراكز.",
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, False),
+            )
+        finally:
+            db.close()
+        return
+
     # ——— أزرار التحكم داخل المحفظة ———
     if data.startswith("toggle_"):
         pf_id = int(data.split("_")[1])
@@ -1293,6 +1325,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     None,
                     lambda c=coin, a=buy_amt: reb.reentry_buy_and_place_tp(
                         c.symbol, a, tp1, tp2, tp3, sl_pct, s1, s2,
+                        control_mode=getattr(p, "control_mode", "smart"),
                     ),
                 )
                 if result.get("error"):
@@ -1360,19 +1393,23 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 if use_amt <= 0 or entry <= 0:
                     refresh_errors.append(f"{coin.symbol}: لا يوجد رصيد كافٍ")
                     continue
-                # أهداف ذكية لكل عملة حسب سلوكها
-                try:
-                    levels = reb.build_smart_levels_for_entry(
-                        coin.symbol, entry, tp1, tp2, tp3, sl_pct,
-                    )
-                    use_tp1, use_tp2, use_tp3, use_sl = (
-                        levels.tp1_pct, levels.tp2_pct, levels.tp3_pct, levels.stop_loss_pct,
-                    )
-                except Exception:
+                # الوضع اليدوي يحافظ على نسب المستخدم؛ الذكي فقط يحسب ATR.
+                if str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual":
                     use_tp1, use_tp2, use_tp3, use_sl = tp1, tp2, tp3, sl_pct
+                else:
+                    try:
+                        levels = reb.build_smart_levels_for_entry(
+                            coin.symbol, entry, tp1, tp2, tp3, sl_pct,
+                        )
+                        use_tp1, use_tp2, use_tp3, use_sl = (
+                            levels.tp1_pct, levels.tp2_pct, levels.tp3_pct, levels.stop_loss_pct,
+                        )
+                    except Exception:
+                        use_tp1, use_tp2, use_tp3, use_sl = tp1, tp2, tp3, sl_pct
                 result = reb.place_tp_orders(
                     [{"symbol": coin.symbol, "amount": use_amt, "entry_price": entry}],
                     use_tp1, use_tp2, use_tp3, use_sl, s1, s2,
+                    control_mode=getattr(p, "control_mode", "smart"),
                 )[0]
                 if result.get("error"):
                     refresh_errors.append(f"{coin.symbol}: {result['error']}")
@@ -1462,6 +1499,13 @@ async def _do_refresh_tpsl(query, tid, pf_id):
                 reply_markup=pf_keyboard(pf_id, False),
             )
             return
+        if str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual":
+            await query.edit_message_text(
+                "⚠️ هذه المحفظة على الوضع اليدوي.\n"
+                "لن يتم تحويلها للوقف المتحرك حتى لا تتغير أهدافك اليدوية.",
+                reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
 
         user = get_or_create_user(db, tid)
 
@@ -1521,6 +1565,7 @@ async def _do_refresh_tpsl(query, tid, pf_id):
                         "tp3_order_id": getattr(coin, "tp3_order_id", None),
                     }],
                     0, 0, 0, fb_sl, 0, 0,
+                    control_mode="smart",
                 )[0]
                 if result.get("error"):
                     errors.append(f"{coin.symbol}: {result['error']}")
@@ -1867,8 +1912,9 @@ async def _do_missing_reentry(query, context, tid, pf_id):
             try:
                 result = await loop.run_in_executor(
                     None,
-                    lambda symbol=symbol: get_reb().reentry_buy_and_place_tp(
-                        symbol, per_coin_usdt, tp1, tp2, tp3, sl_pct, s1, s2
+            lambda symbol=symbol: get_reb().reentry_buy_and_place_tp(
+                        symbol, per_coin_usdt, tp1, tp2, tp3, sl_pct, s1, s2,
+                        control_mode=getattr(pf, "control_mode", "smart"),
                     ),
                 )
             except Exception as exc:
@@ -1963,6 +2009,7 @@ async def _do_manual_reentry(query, tid, event_id):
             None,
             lambda: get_reb().reentry_buy_and_place_tp(
                 coin.symbol, usdt, tp1, tp2, tp3, sl_pct, s1, s2,
+                control_mode=getattr(pf, "control_mode", "smart"),
             ),
         )
         if result.get("error"):
@@ -2074,6 +2121,12 @@ async def _do_start(query, tid, pf_id):
         s1 = _pct(getattr(p, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
         s2 = _pct(getattr(p, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 30.0)
         sl_pct = _pct(getattr(p, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
+        if str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual":
+            # Keep the resolved user defaults on the portfolio so the monitor
+            # uses exactly the same percentages after this session ends.
+            p.tp1_pct, p.tp2_pct, p.tp3_pct = tp1, tp2, tp3
+            p.tp1_sell_pct, p.tp2_sell_pct, p.stop_loss_pct = s1, s2, sl_pct
+            db.flush()
 
         purchase_result = {"executed": [], "errors": []}
         if missing_coins:
@@ -2115,7 +2168,8 @@ async def _do_start(query, tid, pf_id):
             coins_data.append({"symbol": c.symbol, "amount": amount, "entry_price": price})
 
         tp_results = get_reb().place_tp_orders(
-            coins_data, tp1, tp2, tp3, sl_pct, s1, s2
+            coins_data, tp1, tp2, tp3, sl_pct, s1, s2,
+            control_mode=getattr(p, "control_mode", "smart"),
         )
 
         lines = [
@@ -2543,6 +2597,9 @@ async def market_sense_job(context: ContextTypes.DEFAULT_TYPE):
             pf = coin.portfolio
             if not pf or not pf.is_running:
                 continue
+            # المحافظ اليدوية لا تدخل في قرارات الدفاع أو الخروج الذكي.
+            if str(getattr(pf, "control_mode", "smart") or "smart").lower() == "manual":
+                continue
             by_user.setdefault(int(pf.telegram_id), []).append(coin)
 
         # مستخدمون مفعّل عندهم النظام حتى بدون مراكز (لتنبيه فقط)
@@ -2706,6 +2763,7 @@ async def smart_levels_refresh_job(context: ContextTypes.DEFAULT_TYPE):
         openish = [
             c for c in positions
             if (c.position_status or "") in ("open", "tp1_hit", "tp2_hit")
+            and str(getattr(getattr(c, "portfolio", None), "control_mode", "smart") or "smart").lower() != "manual"
         ]
         if not openish:
             return
@@ -2951,14 +3009,20 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     update_coin_position(
                         db, coin.id,
                         position_status="tp1_hit",
-                        current_sl_price=coin.entry_price,
+                        current_sl_price=(
+                            coin.current_sl_price
+                            if str(getattr(getattr(coin, "portfolio", None), "control_mode", "smart") or "smart").lower() == "manual"
+                            else coin.entry_price
+                        ),
                         remaining_amount=new_rem,
                         tp1_order_id=None,
                     )
+                    manual_mode = str(getattr(getattr(coin, "portfolio", None), "control_mode", "smart") or "smart").lower() == "manual"
+                    tp1_protection = "الاستوب اليدوي ظل ثابتاً" if manual_mode else f"تم نقل الاستوب إلى سعر الدخول `{coin.entry_price:.6g}`"
                     msg = (
                         f"🎯 *تحقق الهدف 1* — `{symbol}`\n"
                         f"السعر: `{act['price']:.6g}`\n"
-                        f"تم نقل الاستوب إلى سعر الدخول `{coin.entry_price:.6g}`\n"
+                        f"{tp1_protection}\n"
                         f"المحفظة: *{pf.name if pf else '—'}*"
                     )
                 try:
@@ -3006,15 +3070,22 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     update_coin_position(
                         db, coin.id,
                         position_status="tp2_hit",
-                        current_sl_price=act["new_sl"],
+                        current_sl_price=(
+                            coin.current_sl_price
+                            if str(getattr(getattr(coin, "portfolio", None), "control_mode", "smart") or "smart").lower() == "manual"
+                            else act["new_sl"]
+                        ),
                         remaining_amount=new_rem,
                         tp2_order_id=None,
                     )
+                    manual_mode = str(getattr(getattr(coin, "portfolio", None), "control_mode", "smart") or "smart").lower() == "manual"
+                    tp2_protection = "الاستوب اليدوي ظل ثابتاً" if manual_mode else f"تم رفع الاستوب لحماية الربح إلى `{act['new_sl']:.6g}`"
+                    tp2_mode = "(الجزء المتبقي يعمل بالأهداف اليدوية)" if manual_mode else "(الجزء المتبقي يعمل بـ Trailing Stop)"
                     msg = (
                         f"🎯 *تحقق الهدف 2* — `{symbol}`\n"
                         f"السعر: `{act['price']:.6g}`\n"
-                        f"تم رفع الاستوب لحماية الربح إلى `{act['new_sl']:.6g}`\n"
-                        f"(الجزء المتبقي يعمل بـ Trailing Stop)\n"
+                        f"{tp2_protection}\n"
+                        f"{tp2_mode}\n"
                         f"المحفظة: *{pf.name if pf else '—'}*"
                     )
                 try:

@@ -47,6 +47,8 @@ class Portfolio(Base):
 
     allocation_method = Column(String(20), default="equal")
     rebalance_mode = Column(String(20), default="threshold")
+    # smart = adaptive levels + trailing; manual = configured TP/SL monitored by the bot
+    control_mode = Column(String(10), default="smart", nullable=False)
     threshold = Column(Float, default=2.0)
     rebalance_interval_hours = Column(Integer, default=24)
 
@@ -157,6 +159,8 @@ def init_db():
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN stopped_at TIMESTAMP"))
             if "base_investment" not in cols:
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN base_investment DOUBLE PRECISION DEFAULT 0"))
+            if "control_mode" not in cols:
+                conn.execute(text("ALTER TABLE portfolios ADD COLUMN control_mode VARCHAR(10) DEFAULT 'smart'"))
             for col in ("tp1_pct", "tp2_pct", "tp3_pct", "tp1_sell_pct", "tp2_sell_pct", "stop_loss_pct"):
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE portfolios ADD COLUMN {col} DOUBLE PRECISION"))
