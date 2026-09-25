@@ -160,7 +160,7 @@ def _missing_reentry_keyboard(pf_id: int, missing_symbols, selected, allow_selec
 
 
 def format_pf(p, current_value: float = None) -> str:
-    """عرض محفظة: حالة + خبراء + قيمة + عملات."""
+    """عرض محفظة: حالة + قيمة + عملات."""
     status = "🟢 شغالة" if p.is_running else "⚪ متوقفة"
     allocated = float(p.investment_usdt or 0)
 
@@ -182,37 +182,20 @@ def format_pf(p, current_value: float = None) -> str:
     else:
         coins_block = "—"
 
-    # حالة الخبراء لهذه المحفظة
-    action_ar = {"BUY": "شراء", "SELL": "بيع", "FLAT": "انتظار"}.get(exp_action or "", "—")
-    if exp_on:
-        exp_line = f"🧠 الخبراء: *مفعّل* | TF `{exp_tf}`"
-    else:
-        exp_line = "🧠 الخبراء: *معطّل*"
-    if exp_action:
-        when = exp_at.strftime("%m-%d %H:%M") if exp_at else "—"
-        exp_status = f"آخر قرار: *{action_ar}* ({when} UTC)"
-    else:
-        exp_status = "آخر قرار: لم يُحلَّل بعد"
-
-    lines = [
+    out = [
         f"📁 *{p.name}*  `#{p.id}`",
         "━━━━━━━━━━━━━━━━━━━━",
         f"الحالة: *{status}*",
         f"المخصص: *{allocated:.2f}* USDT",
     ]
     if current_value is not None:
-        lines.append(f"القيمة الحالية: *{current_value:.2f}* USDT")
+        out.append(f"القيمة الحالية: *{current_value:.2f}* USDT")
     if pnl_line:
-        lines.append(pnl_line)
-    lines.append(exp_line)
-    lines.append(exp_status)
-    if exp_sum and exp_on:
-        short = exp_sum if len(exp_sum) <= 120 else exp_sum[:117] + "..."
-        lines.append(f"ملخص: _{short}_")
-    lines.append("")
-    lines.append(f"*العملات* ({len(symbols)})")
-    lines.append(coins_block)
-    return "\n".join(lines)
+        out.append(pnl_line)
+    out.append("")
+    out.append(f"*العملات* ({len(symbols)})")
+    out.append(coins_block)
+    return "\n".join(out)
 
 
 def format_portfolio_stats(p, events, prices=None) -> str:
@@ -546,6 +529,35 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if context.user_data.get("waiting"):
+        # تعديل إعدادات عامة
+        user_field = context.user_data.get("edit_user_tpsl")
+        if user_field:
+            try:
+                val = float(text.strip().replace("%", "").replace(",", "."))
+                if val < 0 or val > 100:
+                    await update.message.reply_text("أدخل رقم بين 0 و 100.")
+                    return
+                db = SessionLocal()
+                try:
+                    user = get_or_create_user(db, update.effective_user.id)
+                    if hasattr(user, user_field):
+                        setattr(user, user_field, val)
+                        db.commit()
+                        await update.message.reply_text(
+                            f"✅ تم تحديث `{user_field}` = `{val}`",
+                            parse_mode="Markdown",
+                            reply_markup=main_menu_keyboard(),
+                        )
+                    else:
+                        await update.message.reply_text("حقل غير معروف.", reply_markup=main_menu_keyboard())
+                finally:
+                    db.close()
+                context.user_data.clear()
+            except ValueError:
+                await update.message.reply_text("أدخل رقم صحيح (مثال: 5)")
+            return
+
+        # تعديل أهداف محفظة معيّنة
         pf_edit = context.user_data.get("edit_pf_tpsl")
         if pf_edit:
             try:
@@ -670,6 +682,108 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         finally:
             db.close()
+        return
+
+    if data == "balance":
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(None, lambda: get_mexc().get_portfolio_value())
+            total = float(info.get("total_usdt") or 0)
+            assets = info.get("assets") or {}
+            lines = [f"💰 *رصيد الحساب*", f"الإجمالي ≈ `{total:.2f}` USDT", ""]
+            # sort by value desc
+            items = sorted(
+                ((k, v) for k, v in assets.items() if float(v.get("usdt_value") or 0) > 0.5),
+                key=lambda x: float(x[1].get("usdt_value") or 0),
+                reverse=True,
+            )
+            for sym, row in items[:25]:
+                lines.append(
+                    f"`{sym}`: `{float(row.get('amount') or 0):.6g}` ≈ `{float(row.get('usdt_value') or 0):.2f}$`"
+                )
+            if not items:
+                lines.append("_لا توجد أرصدة تُذكر_")
+            await query.edit_message_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception as e:
+            logger.exception("balance failed")
+            await query.edit_message_text(
+                f"⚠️ فشل جلب الرصيد: `{e}`",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+        return
+
+    if data == "settings":
+        db = SessionLocal()
+        try:
+            user = get_or_create_user(db, tid)
+            msg = (
+                "⚙️ *الإعدادات العامة*\n\n"
+                f"TP1: `{user.tp1_pct or 3}%` | بيع: `{user.tp1_sell_pct or 40}%`\n"
+                f"TP2: `{user.tp2_pct or 5}%` | بيع: `{user.tp2_sell_pct or 30}%`\n"
+                f"TP3: `{user.tp3_pct or 8}%`\n"
+                f"وقف الخسارة: `{user.stop_loss_pct or 3}%`\n"
+                f"أقصى عملات/محفظة: `{user.max_coins_per_portfolio or 30}`\n\n"
+                "_لتعديل أهداف محفظة معيّنة: افتح المحفظة → الأهداف_"
+            )
+            await query.edit_message_text(
+                msg,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("TP1 %", callback_data="set_tp1_pct"),
+                     InlineKeyboardButton("بيع 1 %", callback_data="set_tp1_sell_pct")],
+                    [InlineKeyboardButton("TP2 %", callback_data="set_tp2_pct"),
+                     InlineKeyboardButton("بيع 2 %", callback_data="set_tp2_sell_pct")],
+                    [InlineKeyboardButton("TP3 %", callback_data="set_tp3_pct"),
+                     InlineKeyboardButton("استوب %", callback_data="set_stop_loss_pct")],
+                    [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
+
+    if data.startswith("set_") and data in (
+        "set_tp1_pct", "set_tp2_pct", "set_tp3_pct",
+        "set_tp1_sell_pct", "set_tp2_sell_pct", "set_stop_loss_pct",
+    ):
+        field = data[len("set_"):]
+        context.user_data["waiting"] = True
+        context.user_data["edit_user_tpsl"] = field
+        labels = {
+            "tp1_pct": "هدف 1 %",
+            "tp2_pct": "هدف 2 %",
+            "tp3_pct": "هدف 3 %",
+            "tp1_sell_pct": "نسبة البيع عند الهدف 1",
+            "tp2_sell_pct": "نسبة البيع عند الهدف 2",
+            "stop_loss_pct": "وقف الخسارة %",
+        }
+        await query.edit_message_text(
+            f"أرسل قيمة *{labels.get(field, field)}*:\n(رقم بين 0 و 100)",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="settings")],
+            ]),
+        )
+        return
+
+    if data == "cleanup_db":
+        await _show_cleanup_scan(query, context, tid)
+        return
+
+    if data == "cleanup_confirm":
+        if not context.user_data.get("cleanup_ready"):
+            await query.edit_message_text(
+                "⚠️ اعمل فحص أولاً من زر التنظيف.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        await _do_cleanup(query, context, tid)
         return
 
     if data.startswith("view_") and not data.startswith("view_src_"):
@@ -2240,7 +2354,7 @@ async def market_sense_job(context: ContextTypes.DEFAULT_TYPE):
         for tid, coins in by_user.items():
             # الإدارة لكل محفظة شغالة (is_running) بدون نظام عام
 
-            # قيمة تقريبية للمراكز المفتوحة
+            # ربح/خسارة حقيقية من سعر الدخول — مش قيمة الباقي بعد البيع الجزئي
             symbols = list({c.symbol for c in coins})
             prices = {}
             try:
@@ -2248,7 +2362,8 @@ async def market_sense_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 prices = {}
 
-            equity = 0.0
+            cost_usdt = 0.0   # تكلفة الدخول للكمية المتبقية
+            value_usdt = 0.0  # القيمة السوقية الحالية
             for c in coins:
                 px = float(prices.get(c.symbol) or prices.get(f"{c.symbol}/USDT") or 0)
                 if px <= 0:
@@ -2257,12 +2372,28 @@ async def market_sense_job(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         px = 0
                 amt = float(c.remaining_amount or c.amount or 0)
-                equity += amt * px
+                entry = float(c.entry_price or 0)
+                if amt <= 0:
+                    continue
+                if entry > 0:
+                    cost_usdt += entry * amt
+                if px > 0:
+                    value_usdt += px * amt
+                elif entry > 0:
+                    value_usdt += entry * amt  # fallback
 
-            loss_hit, loss_msg = daily_loss_triggered(tid, equity)
+            pnl_usdt = value_usdt - cost_usdt
+            pnl_pct = ((value_usdt / cost_usdt) - 1.0) * 100.0 if cost_usdt > 0 else 0.0
+
+            loss_hit, loss_msg = daily_loss_triggered(tid, pnl_pct, pnl_usdt, cost_usdt)
             defense = reg.defense_level
-            if loss_hit:
+            # الخسارة اليومية وحدها ما تحولش لخروج طارئ لو السوق متوازن
+            # (منع البيع الجماعي بسبب بيع أهداف ناجحة أو تذبذب عادي)
+            if loss_hit and reg.defense_level >= 1:
                 defense = max(defense, 2)
+            elif loss_hit and reg.defense_level == 0:
+                # تنبيه فقط — منغير تصفية
+                defense = 0
 
             if defense <= 0:
                 continue
@@ -2995,16 +3126,38 @@ def main():
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
     async def entry_create(update, context):
-        await on_callback(update, context)
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await ensure_admin(update):
+            return ConversationHandler.END
+        context.user_data["create"] = {}
+        await query.edit_message_text(
+            "📝 أرسل *اسم المحفظة*:",
+            parse_mode="Markdown",
+        )
         return CREATE_NAME
 
     async def entry_addcoin(update, context):
-        await on_callback(update, context)
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await ensure_admin(update):
+            return ConversationHandler.END
+        data = query.data or ""
+        pf_id = int(data.split("_")[1])
+        context.user_data["addcoin_pf"] = pf_id
+        await query.edit_message_text("أرسل رمز العملة (مثال: BTC أو ETH):")
         return ADD_COIN
 
     async def entry_increase(update, context):
+        # زيادة رأس المال صارت عبر إعادة البناء — نوجّه المستخدم
         await on_callback(update, context)
-        return INCREASE_AMOUNT
+        return ConversationHandler.END
 
     conv = ConversationHandler(
         entry_points=[

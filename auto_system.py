@@ -36,7 +36,7 @@ BTC_WEAK_1H = -2.0
 BTC_BLACK_1H = -3.5
 BTC_BLACK_4H = -5.0
 BTC_CRASH_4H = -7.0          # انهيار حاد → خروج طارئ
-DAILY_LOSS_LIMIT_PCT = -8.0  # خسارة من قمة اليوم
+DAILY_LOSS_LIMIT_PCT = -8.0  # خسارة حقيقية % من سعر الدخول (مش قيمة الباقي بعد البيع)
 
 # دفاع
 DEFENSE_TRAIL_PCT = 2.0      # تضييق الـ trail في الضعف
@@ -133,25 +133,41 @@ def should_allow_entry(telegram_id: int, client=None) -> Tuple[bool, str]:
     return True, reg.message
 
 
-def update_daily_peak(telegram_id: int, equity_usdt: float) -> Tuple[float, float]:
-    """يرجع (القمة اليومية، التغير % من القمة)."""
+def update_daily_peak_pnl(telegram_id: int, pnl_pct: float) -> Tuple[float, float]:
+    """يتتبع أفضل نسبة ربح/خسارة غير محققة خلال اليوم.
+
+    يرجع (أفضل_نسبة_اليوم، الهبوط_بالنقاط_عن_القمة).
+    مثال: القمة كانت +12% والآن +3% → dd = -9 نقاط.
+    """
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    key = f"{telegram_id}:{day}"
-    peak = _daily_peak.get(key, 0.0)
-    if equity_usdt > peak:
-        peak = equity_usdt
+    key = f"{telegram_id}:{day}:pnl"
+    peak = _daily_peak.get(key)
+    if peak is None or pnl_pct > peak:
+        peak = pnl_pct
         _daily_peak[key] = peak
-    if peak <= 0:
-        return peak, 0.0
-    dd = (equity_usdt / peak - 1.0) * 100.0
-    return peak, dd
+    dd = pnl_pct - float(peak)
+    return float(peak), float(dd)
 
 
-def daily_loss_triggered(telegram_id: int, equity_usdt: float) -> Tuple[bool, str]:
-    peak, dd = update_daily_peak(telegram_id, equity_usdt)
-    if peak > 0 and dd <= DAILY_LOSS_LIMIT_PCT:
-        return True, f"حد خسارة يومي: {dd:.1f}% من قمة اليوم ({peak:.1f}$)"
-    return False, f"من قمة اليوم: {dd:+.1f}%"
+def daily_loss_triggered(telegram_id: int, pnl_pct: float, pnl_usdt: float = 0.0, cost_usdt: float = 0.0) -> Tuple[bool, str]:
+    """حد الخسارة اليومي مبني على ربح/خسارة حقيقية من سعر الدخول — مش قيمة الباقي.
+
+    - pnl_pct: ((القيمة الحالية - تكلفة الدخول) / تكلفة الدخول) * 100 للمراكز المفتوحة
+    - يتفعل لو:
+        1) الخسارة المطلقة <= DAILY_LOSS_LIMIT_PCT  (مثلاً -8%)
+        أو
+        2) الهبوط من أفضل نسبة ربح اليوم <= DAILY_LOSS_LIMIT_PCT نقاط
+    """
+    peak, dd_from_peak = update_daily_peak_pnl(telegram_id, pnl_pct)
+    hit_abs = pnl_pct <= DAILY_LOSS_LIMIT_PCT
+    hit_dd = dd_from_peak <= DAILY_LOSS_LIMIT_PCT and peak > 0
+    detail = (
+        f"PnL مفتوح: {pnl_pct:+.1f}% ({pnl_usdt:+.1f}$ على تكلفة {cost_usdt:.1f}$) | "
+        f"أفضل اليوم: {peak:+.1f}% | من القمة: {dd_from_peak:+.1f} نقطة"
+    )
+    if hit_abs or hit_dd:
+        return True, f"حد خسارة يومي: {detail}"
+    return False, detail
 
 
 def portfolio_specs() -> List[Dict[str, Any]]:
