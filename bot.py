@@ -1876,7 +1876,7 @@ async def _do_missing_reentry(query, context, tid, pf_id):
                 tp2_order_id=result.get("tp2_order_id"),
                 tp3_order_id=result.get("tp3_order_id"),
                 position_status="open",
-                reentry_used=True,
+                reentry_used=False,
                 reentry_touched=False,
                 reentry_price=0.0,
             )
@@ -1913,7 +1913,7 @@ async def _do_manual_reentry(query, tid, event_id):
     db = SessionLocal()
     try:
         event = get_trade_event(db, event_id, tid)
-        if not event or event.event_type != "stop_loss" or not event.reentry_available or event.reentry_used:
+        if not event or event.event_type != "stop_loss":
             await query.edit_message_text("عملية إعادة الدخول غير متاحة أو تم تنفيذها مسبقاً.", reply_markup=main_menu_keyboard())
             return
         pf = get_portfolio(db, event.portfolio_id, tid)
@@ -1972,7 +1972,7 @@ async def _do_manual_reentry(query, tid, event_id):
             tp2_order_id=result.get("tp2_order_id"),
             tp3_order_id=result.get("tp3_order_id"),
             position_status="open",
-            reentry_used=True,
+            reentry_used=False,
             reentry_touched=False,
             reentry_price=0.0,
         )
@@ -3043,13 +3043,16 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 if new_sl <= old_sl:
                     continue
                 update_coin_position(db, coin.id, current_sl_price=new_sl)
-                pump_tag = " (بامب)" if act.get("pump") else ""
+                mode = act.get("mode") or "trail"
+                mode_ar = {"trail": "متحرك", "pump": "بامب", "pump_strong": "بامب قوي"}.get(mode, mode)
                 gain = act.get("gain_pct")
-                gain_txt = f"\nالربح: `+{float(gain):.1f}%`" if gain is not None else ""
+                trail_pct = act.get("trail_pct")
+                gain_txt = f"\nالربح من الدخول: `+{float(gain):.1f}%`" if gain is not None else ""
+                trail_txt = f" | مسافة `{float(trail_pct):.1f}%`" if trail_pct else ""
                 msg = (
-                    f"📈 *Trailing{pump_tag}* — `{symbol}`\n"
+                    f"📈 *وقف متحرك ({mode_ar})* — `{symbol}`\n"
                     f"السعر: `{act['price']:.6g}`{gain_txt}\n"
-                    f"الاستوب الجديد: `{new_sl:.6g}`\n"
+                    f"الاستوب: `{old_sl:.6g}` → `{new_sl:.6g}`{trail_txt}\n"
                     f"المحفظة: *{pf.name if pf else '—'}*"
                 )
                 try:
@@ -3169,18 +3172,15 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                         tp2_order_id=buy_res.get("tp2_order_id"),
                         tp3_order_id=buy_res.get("tp3_order_id"),
                         position_status="open",
-                        reentry_used=True,
+                        reentry_used=False,
                         reentry_touched=False,
                         reentry_price=0.0,
                     )
                     msg = (
                         f"🔄 *إعادة دخول* — `{symbol}`\n"
                         f"شراء عند ≈ `{buy_res.get('entry_price', act['price']):.6g}`\n"
-                        f"TP1 `{buy_res.get('tp1_price', 0):.6g}` | "
-                        f"TP2 `{buy_res.get('tp2_price', 0):.6g}` | "
-                        f"TP3 `{buy_res.get('tp3_price', 0):.6g}`\n"
-                        f"SL `{buy_res.get('sl_price', 0):.6g}`\n"
-                        f"(مرة واحدة فقط لهذه الدورة)\n"
+                        f"وقف متحرك | SL `{buy_res.get('sl_price', 0):.6g}`\n"
+                        f"وقف متحرك مفعّل — إعادة الدخول متاحة مرة أخرى بعد أي استوب\n"
                         f"المحفظة: *{pf.name if pf else '—'}*"
                     )
                     try:
@@ -3202,32 +3202,31 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 )
                 # Auto re-entry: park in waiting_reentry with trigger price.
                 # Manual button still available as backup.
-                new_status = "waiting_reentry" if reentry_available else "stopped"
+                # دائماً متاح لإعادة الدخول — مش مرة واحدة
+                reentry_available = True
+                trigger = float(act.get("reentry_price") or 0)
                 update_coin_position(
                     db, coin.id,
-                    position_status=new_status,
-                    current_sl_price=0.0,
+                    position_status="waiting_reentry",
+                    current_sl_price=float(act.get("sl") or 0) or 0.0,
                     tp_order_id=None,
                     tp1_order_id=None,
                     tp2_order_id=None,
                     tp3_order_id=None,
                     amount=0.0,
                     remaining_amount=0.0,
-                    reentry_price=act.get("reentry_price", 0.0),
+                    reentry_price=trigger,
                     reentry_touched=False,
-                    reentry_used=not reentry_available,
+                    reentry_used=False,
                 )
-                raised = " (بعد رفع الاستوب)" if act.get("was_raised") else ""
-                trigger = float(act.get("reentry_price") or 0)
-                if reentry_available and trigger > 0:
+                raised = " (بعد التريلينج)" if act.get("was_raised") else ""
+                if trigger > 0:
                     extra = (
-                        f"إعادة دخول تلقائي عند الرجوع فوق `{trigger:.6g}` "
-                        f"(+{1.2:.1f}%) — مرة واحدة فقط"
+                        f"⏳ إعادة دخول تلقائي عند الرجوع فوق `{trigger:.6g}` "
+                        f"(+1%) — متكرر كلما اتضرب الاستوب"
                     )
-                elif reentry_available:
-                    extra = "يمكنك اختيار إعادة الدخول من زر الاستوبات."
                 else:
-                    extra = "لا توجد إعادة دخول متاحة لهذه الدورة."
+                    extra = "إعادة الدخول التلقائي مفعّلة."
                 msg = (
                     f"🛡 *ضرب الاستوب{raised}* — `{symbol}`\n"
                     f"تم البيع فوراً بسعر السوق ≈ `{act['price']:.6g}`\n"

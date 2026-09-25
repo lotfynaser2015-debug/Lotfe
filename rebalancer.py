@@ -9,19 +9,24 @@ from smart_levels import (
 
 logger = logging.getLogger(__name__)
 
-# Auto re-entry: price must recover this % above the stop that was hit
-REENTRY_RECOVER_PCT = 1.2
-# Minimum minutes after stop before auto re-entry is allowed (soft; enforced in bot if needed)
-REENTRY_COOLDOWN_HINT_MIN = 20
-# Trailing distance when ATR is unknown (percent)
-DEFAULT_TRAIL_PCT = 1.8
-# Pump / strong-move detection (from entry, no extra API)
-PUMP_GAIN_PCT = 6.0          # ربح من الدخول ≥ 6% → وضع بامب
-PUMP_STRONG_GAIN_PCT = 12.0  # ربح ≥ 12% → Trailing أوسع
-PUMP_TRAIL_PCT = 3.5         # trail في وضع البامب
-PUMP_STRONG_TRAIL_PCT = 4.5  # trail في البامب القوي
-# أقل من 10$ → هدف واحد فقط (TP1 بنسبة 100%)؛ 10$ فأكثر → تقسيم 3 أهداف
-SMALL_TRADE_USDT = 10.0
+# ===== نظام الوقف المتحرك (Trailing Stop) — بدون أهداف ثابتة =====
+# الاستوب الابتدائي تحت الدخول
+INITIAL_SL_PCT = 3.0
+# بعد ربح بهذا القدر → الاستوب على سعر الدخول (break-even)
+BE_LOCK_PCT = 1.2
+# مسافة الـ trailing الافتراضية تحت السعر الحالي
+DEFAULT_TRAIL_PCT = 2.0
+# عند ربح قوي: مسافة أوسع عشان مايتقفلش بدري
+PUMP_GAIN_PCT = 6.0
+PUMP_STRONG_GAIN_PCT = 12.0
+PUMP_TRAIL_PCT = 3.2
+PUMP_STRONG_TRAIL_PCT = 4.0
+# إعادة الدخول: السعر لازم يرجع فوق الاستوب المضروب بهذا القدر
+REENTRY_RECOVER_PCT = 1.0
+# تبريد خفيف بالثواني بين محاولات إعادة الدخول لنفس العملة (منع سبام أوامر)
+REENTRY_COOLDOWN_SEC = 90
+# حد أدنى لقيمة المركز عشان نعتبره مفتوح (dust)
+MIN_POSITION_USDT = 0.8
 
 
 class Rebalancer:
@@ -172,28 +177,27 @@ class Rebalancer:
     def place_tp_orders(
         self,
         coins_data: List[Dict[str, Any]],
-        tp1_pct: float,
-        tp2_pct: float,
-        tp3_pct: float,
-        stop_loss_pct: float,
-        tp1_sell_pct: float = 40.0,
-        tp2_sell_pct: float = 30.0,
+        tp1_pct: float = 0.0,
+        tp2_pct: float = 0.0,
+        tp3_pct: float = 0.0,
+        stop_loss_pct: float = None,
+        tp1_sell_pct: float = 0.0,
+        tp2_sell_pct: float = 0.0,
         skip_stages: Optional[List[str]] = None,
     ) -> List[Dict]:
-        """Place the remaining TP limit orders on MEXC + calculate the SL.
+        """تهيئة وقف متحرك فقط — بدون أوامر أهداف ثابتة على المنصة.
 
-        ``skip_stages`` is used when a target was already filled and the
-        portfolio's targets are being refreshed. It prevents recreating a
-        sell order for a target that has already been taken.
+        - يلغي أي أوامر TP قديمة إن وُجدت
+        - يحسب استوب ابتدائي تحت الدخول (INITIAL_SL_PCT أو stop_loss_pct)
+        - الإدارة الفعلية تتم في check_and_manage_positions (رفع الاستوب مع السعر)
         """
         results = []
-        skipped = set(skip_stages or [])
+        sl_pct = float(stop_loss_pct) if stop_loss_pct and float(stop_loss_pct) > 0 else INITIAL_SL_PCT
         for item in coins_data:
             symbol = item["symbol"]
             amount = float(item.get("amount") or 0)
             entry = float(item.get("entry_price") or 0)
             if amount <= 0:
-                # Prefer free; fall back to total (locked in old orders may still exist)
                 amount = self.client.get_free_amount(symbol)
                 if amount <= 0:
                     amount = self.client.get_total_amount(symbol)
@@ -204,159 +208,62 @@ class Rebalancer:
                 results.append({"symbol": symbol, "error": "no amount or price"})
                 continue
 
-            tp1 = entry * (1 + tp1_pct / 100.0)
-            tp2 = entry * (1 + tp2_pct / 100.0)
-            tp3 = entry * (1 + tp3_pct / 100.0)
-            sl = entry * (1 - stop_loss_pct / 100.0)
+            # إلغاء أوامر بيع قديمة (أهداف ثابتة من النظام السابق)
+            for oid_key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
+                oid = item.get(oid_key)
+                if oid:
+                    try:
+                        self.client.cancel_order(oid, f"{symbol}/{self.quote}")
+                    except Exception:
+                        pass
 
-            position_usdt = amount * entry
-            small_trade = position_usdt < SMALL_TRADE_USDT
-
-            orders = {"tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None}
-            errors = []
-            if small_trade:
-                # أقل من 8$: هدف واحد فقط (عند TP2 تقريباً) + الباقي يُدار بالـ trailing/الاستوب
-                # تجنب تقطيع 5$ لشرائح تفشل على حد المنصة
-                single_pct = max(tp1_pct, min(tp2_pct, (tp1_pct + tp2_pct) / 2.0))
-                single_price = entry * (1 + single_pct / 100.0)
-                # نخزّن المستويات للمرجع حتى لو أمر واحد
-                tp1 = single_price
-                tp2 = entry * (1 + max(tp2_pct, single_pct + 2) / 100.0)
-                tp3 = entry * (1 + max(tp3_pct, single_pct + 5) / 100.0)
-                planned = [
-                    ("tp1", "tp1_order_id", single_price, 100.0),
-                ]
-            else:
-                planned = [
-                    ("tp1", "tp1_order_id", tp1, max(0.0, tp1_sell_pct)),
-                    ("tp2", "tp2_order_id", tp2, max(0.0, tp2_sell_pct)),
-                    ("tp3", "tp3_order_id", tp3, max(0.0, 100.0 - tp1_sell_pct - tp2_sell_pct)),
-                ]
-            active = [stage for stage in planned if stage[0] not in skipped and stage[3] > 0]
-            # فلترة الشرائح اللي قيمتها أقل من 1 USDT ودمج وزنها في آخر شريحة صالحة
-            MIN_NOTIONAL = 1.05  # هامش فوق حد MEXC (1 USDT)
-            viable = []
-            leftover_weight = 0.0
-            total_weight = sum(s[3] for s in active) or 1.0
-            for stage, key, price, weight in active:
-                qty = amount * (weight / total_weight)
-                notional = qty * price
-                if notional < MIN_NOTIONAL:
-                    leftover_weight += weight
+            # استوب ابتدائي — يُرفع لاحقاً بالـ trailing
+            try:
+                levels = self.build_smart_levels_for_entry(
+                    symbol, entry,
+                    fallback_tp1=3.0, fallback_tp2=5.0, fallback_tp3=8.0,
+                    fallback_sl=sl_pct,
+                )
+                smart_sl = float(getattr(levels, "stop_loss_pct", 0) or 0)
+                if smart_sl > 0:
+                    sl_pct_use = min(max(smart_sl, 1.5), 6.0)
                 else:
-                    viable.append([stage, key, price, weight])
-            if viable and leftover_weight > 0:
-                # ادمج الوزن الصغير في آخر هدف صالح
-                viable[-1][3] += leftover_weight
-            elif not viable and active:
-                # كل الشرائح صغيرة → حط أمر واحد على أقرب هدف (TP1 أو أول متاح)
-                stage, key, price, weight = active[0]
-                viable = [[stage, key, price, total_weight]]
+                    sl_pct_use = sl_pct
+            except Exception:
+                sl_pct_use = sl_pct
 
-            active_weight = sum(s[3] for s in viable) or 1.0
-            for stage, key, price, weight in viable:
-                qty = amount * (weight / active_weight) if active_weight > 0 else 0.0
-                if qty <= 0:
-                    continue
-                try:
-                    order = self.client.create_limit_sell(symbol, qty, price)
-                    if order is None:
-                        # أقل من الحد الأدنى — تجاوز بهدوء
-                        continue
-                    orders[key] = order.get("id") if order else None
-                except Exception as e:
-                    logger.warning(f"{key} failed for {symbol}: {e}")
-                    errors.append(f"{key}: {e}")
-
+            sl = entry * (1.0 - sl_pct_use / 100.0)
             results.append({
                 "symbol": symbol,
+                "amount": amount,
                 "entry_price": entry,
-                "tp1_price": tp1,
-                "tp2_price": tp2,
-                "tp3_price": tp3,
+                "tp1_price": 0.0,
+                "tp2_price": 0.0,
+                "tp3_price": 0.0,
+                "stop_loss_price": sl,
                 "sl_price": sl,
                 "original_sl_price": sl,
-                "amount": amount,
-                "remaining_amount": amount,
-                **orders,
-                "error": "; ".join(errors) if errors else None,
+                "tp1_order_id": None,
+                "tp2_order_id": None,
+                "tp3_order_id": None,
+                "tp_order_id": None,
+                "mode": "trailing_only",
+                "trail_pct": DEFAULT_TRAIL_PCT,
+                "sl_pct": sl_pct_use,
+                "error": None,
             })
         return results
 
-    def cancel_tp_orders(self, coins_with_orders: List[Dict]) -> Dict[str, List]:
-        results = {"cancelled": [], "errors": []}
-        for item in coins_with_orders:
-            sym = item.get("symbol")
-            if not sym:
-                continue
-            for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
-                oid = item.get(key)
-                if oid:
-                    try:
-                        self.client.cancel_order(oid, sym, strict=True)
-                        results["cancelled"].append({"symbol": sym, "order_id": oid, "field": key})
-                    except Exception as exc:
-                        error_text = str(exc)
-                        normalized_error = error_text.lower()
-                        if any(marker in normalized_error for marker in (
-                            "not found", "does not exist", "already canceled",
-                            "already cancelled", "order closed", "filled",
-                        )):
-                            # The exchange confirms that this ID is no longer
-                            # open, so it is safe to continue the cleanup.
-                            results["cancelled"].append({
-                                "symbol": sym,
-                                "order_id": oid,
-                                "field": key,
-                                "already_closed": True,
-                            })
-                        else:
-                            results["errors"].append({
-                                "symbol": sym,
-                                "order_id": oid,
-                                "field": key,
-                                "error": error_text,
-                            })
-        return results
-
-    def _order_filled(self, order_id: Optional[str], symbol: str) -> bool:
-        return self._filled_order_info(order_id, symbol) is not None
-
-    def _filled_order_info(self, order_id: Optional[str], symbol: str) -> Optional[Dict[str, float]]:
-        if not order_id:
-            return None
-        try:
-            order = self.client.fetch_order(order_id, symbol)
-            if not order:
-                return None
-            st = (order.get("status") or "").lower()
-            # A cancelled TP order is not a filled target. Treating it as
-            # filled raises the stop to an untouched TP price and can trigger
-            # an incorrect sell/re-entry cycle.
-            if st in ("canceled", "cancelled", "rejected", "expired"):
-                return None
-            if st not in ("closed", "filled"):
-                return None
-            filled = order.get("filled")
-            try:
-                filled_amount = float(filled or 0)
-            except (TypeError, ValueError):
-                filled_amount = 0.0
-            if filled is not None and filled_amount <= 0:
-                return None
-            average = order.get("average") or order.get("price") or 0
-            try:
-                average_price = float(average or 0)
-            except (TypeError, ValueError):
-                average_price = 0.0
-            return {"filled": filled_amount, "average": average_price}
-        except Exception:
-            return None
-
     def check_and_manage_positions(self, positions: List[Any]) -> List[Dict]:
+        """وقف متحرك + إعادة دخول متكررة (بدون أهداف ثابتة).
+
+        المنطق:
+        1) لو الرصيد ≈ 0 → إغلاق
+        2) لو waiting_reentry والسعر ≥ سعر إعادة الدخول → إشارة شراء (متكرر، مش مرة واحدة)
+        3) لو السعر ≤ الاستوب → بيع سوق + waiting_reentry
+        4) وإلا ارفع الاستوب مع السعر (trailing) بعد قفل break-even
         """
-        Multi-TP + smart re-entry (optimized: one price batch per cycle).
-        """
+        import time
         actions = []
         active = [
             c for c in positions
@@ -366,274 +273,99 @@ class Rebalancer:
         ]
         if not active:
             return actions
+
         symbols = list({c.symbol for c in active})
         try:
-            prices = self.client.get_all_prices(symbols)
+            prices = self.client.get_all_prices(symbols) or {}
         except Exception:
             prices = {}
+
+        now = time.time()
+        # تبريد إعادة الدخول في الذاكرة (per process)
+        if not hasattr(self, "_reentry_cooldown"):
+            self._reentry_cooldown = {}
+
         for coin in active:
             symbol = coin.symbol
-            status = coin.position_status or "idle"
-            price = float(prices.get(symbol) or 0)
+            status = (coin.position_status or "open").strip()
+            price = float(prices.get(symbol) or prices.get(f"{symbol}/{self.quote}") or 0)
             if price <= 0:
                 try:
-                    price = self.client.get_ticker_price(f"{symbol}/{self.quote}")
+                    price = float(self.client.get_ticker_price(f"{symbol}/{self.quote}") or 0)
                 except Exception:
-                    continue
+                    price = 0
             if price <= 0:
                 continue
 
-            # لو مفيش رصيد فعلي والمكان مش waiting_reentry → اقفل المركز صامت
-            if status not in ("waiting_reentry",):
-                try:
-                    free_now = float(self.client.get_free_amount(symbol) or 0)
-                    total_now = float(self.client.get_total_amount(symbol) or 0)
-                except Exception:
-                    free_now = total_now = -1.0
-                rem = float(getattr(coin, "remaining_amount", None) or getattr(coin, "amount", None) or 0)
-                if free_now >= 0 and total_now >= 0 and free_now < 0.001 and total_now < 0.001 and rem > 0:
+            entry = float(coin.entry_price or 0)
+            remaining = float(coin.remaining_amount or coin.amount or 0)
+            sl = float(coin.current_sl_price or 0)
+
+            # ----- رصيد فعلي -----
+            try:
+                free_amt = float(self.client.get_free_amount(symbol) or 0)
+            except Exception:
+                free_amt = remaining
+
+            market_val = free_amt * price
+            if status != "waiting_reentry":
+                if free_amt <= 0 or market_val < MIN_POSITION_USDT:
                     actions.append({
                         "coin_id": getattr(coin, "id", None),
                         "symbol": symbol,
                         "action": "tp_full_close",
-                        "price": price,
-                        "filled_amount": rem,
-                        "fill_price": price,
                         "stage": "balance_zero",
+                        "price": price,
+                        "filled_amount": remaining or free_amt,
+                        "fill_price": price,
                     })
                     continue
 
-            # ----- waiting for auto re-entry (simple) -----
-            # Trigger when price recovers REENTRY_RECOVER_PCT above the stored level.
+            # ----- إعادة دخول متكررة (سلسة) -----
             if status == "waiting_reentry":
-                if getattr(coin, "reentry_used", False):
+                reentry_px = float(getattr(coin, "reentry_price", 0) or 0)
+                if reentry_px <= 0:
+                    # لو مفيش سعر محفوظ، ابنِه من آخر استوب
+                    last_sl = float(coin.current_sl_price or 0)
+                    reentry_px = reentry_trigger_price(last_sl if last_sl > 0 else price, REENTRY_RECOVER_PCT)
+
+                # تبريد: متسمحش بمحاولة كل ثانية
+                last_try = float(self._reentry_cooldown.get(symbol, 0) or 0)
+                if now - last_try < REENTRY_COOLDOWN_SEC:
                     continue
-                reentry = float(getattr(coin, "reentry_price", 0) or 0)
-                if reentry <= 0:
-                    continue
-                if price >= reentry:
+
+                if price >= reentry_px > 0:
+                    self._reentry_cooldown[symbol] = now
                     actions.append({
                         "coin_id": getattr(coin, "id", None),
                         "symbol": symbol,
                         "action": "reentry_buy",
                         "price": price,
-                        "reentry_price": reentry,
+                        "reentry_price": reentry_px,
+                        # مهم: متكررة — البوت لازم يصفّر reentry_used بعد النجاح
+                        "repeatable": True,
+                    })
+                elif price >= reentry_px * 0.995 and not getattr(coin, "reentry_touched", False):
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "reentry_touch",
+                        "price": price,
+                        "reentry_price": reentry_px,
                     })
                 continue
 
-            # ----- normal TP detection -----
-            # لو الكمية المتبقية صغيرة جدًا أو الرصيد الفعلي = dust → إغلاق كامل
-            remaining_db = float(getattr(coin, "remaining_amount", None) or getattr(coin, "amount", None) or 0)
-            actual_free = 0.0
-            try:
-                actual_free = float(self.client.get_free_amount(symbol) or 0)
-            except Exception:
-                actual_free = remaining_db
-
-            def _is_full_fill(filled: float) -> bool:
-                if remaining_db <= 0:
-                    return True
-                if filled >= remaining_db * 0.92:
-                    return True
-                if actual_free < max(0.001, remaining_db * 0.05):
-                    return True
-                return False
-
-            tp1_fill = self._filled_order_info(getattr(coin, "tp1_order_id", None), symbol)
-            if status == "open" and tp1_fill:
-                filled = float(tp1_fill.get("filled") or 0)
-                fill_px = tp1_fill.get("average") or coin.tp1_price
-                if _is_full_fill(filled):
-                    actions.append({
-                        "coin_id": getattr(coin, "id", None),
-                        "symbol": symbol,
-                        "action": "tp_full_close",
-                        "price": price,
-                        "filled_amount": filled or remaining_db,
-                        "fill_price": fill_px,
-                        "stage": "tp1",
-                    })
-                else:
-                    actions.append({
-                        "coin_id": getattr(coin, "id", None),
-                        "symbol": symbol,
-                        "action": "tp1_hit",
-                        "new_sl": float(coin.entry_price or 0),
-                        "price": price,
-                        "filled_amount": filled,
-                        "fill_price": fill_px,
-                    })
-                continue
-            tp2_fill = self._filled_order_info(getattr(coin, "tp2_order_id", None), symbol)
-            if status in ("open", "tp1_hit") and tp2_fill:
-                filled = float(tp2_fill.get("filled") or 0)
-                fill_px = tp2_fill.get("average") or coin.tp2_price
-                if _is_full_fill(filled):
-                    actions.append({
-                        "coin_id": getattr(coin, "id", None),
-                        "symbol": symbol,
-                        "action": "tp_full_close",
-                        "price": price,
-                        "filled_amount": filled or remaining_db,
-                        "fill_price": fill_px,
-                        "stage": "tp2",
-                    })
-                else:
-                    protect = float(coin.tp1_price or 0) or float(coin.entry_price or 0)
-                    entry = float(coin.entry_price or 0)
-                    if protect < entry:
-                        protect = entry
-                    actions.append({
-                        "coin_id": getattr(coin, "id", None),
-                        "symbol": symbol,
-                        "action": "tp2_hit",
-                        "new_sl": protect,
-                        "price": price,
-                        "filled_amount": filled,
-                        "fill_price": fill_px,
-                    })
-                continue
-            tp3_fill = self._filled_order_info(getattr(coin, "tp3_order_id", None), symbol)
-            if status in ("open", "tp1_hit", "tp2_hit") and tp3_fill:
-                filled = float(tp3_fill.get("filled") or 0)
-                fill_px = tp3_fill.get("average") or coin.tp3_price
-                actions.append({
-                    "coin_id": getattr(coin, "id", None),
-                    "symbol": symbol,
-                    "action": "tp_full_close" if _is_full_fill(filled) else "tp3_hit",
-                    "price": price,
-                    "filled_amount": filled or remaining_db,
-                    "fill_price": fill_px,
-                    "stage": "tp3",
-                })
-                continue
-
-            # ----- Pump mode + trailing runner (لا تضيع البامبات) -----
-            # يعتمد على السعر الحالي مقابل الدخول فقط → بدون ضغط API إضافي
-            entry_px = float(coin.entry_price or 0)
-            gain_pct = ((price / entry_px) - 1.0) * 100.0 if entry_px > 0 else 0.0
-            in_pump = gain_pct >= PUMP_GAIN_PCT
-            strong_pump = gain_pct >= PUMP_STRONG_GAIN_PCT
-
-            if in_pump and status in ("open", "tp1_hit", "tp2_hit"):
-                # إلغاء أهداف البيع المحددة المتبقية عشان متتقفلش الصفقة بدري عند TP ثابت
-                has_open_tp = any([
-                    getattr(coin, "tp2_order_id", None) if status in ("open", "tp1_hit") else None,
-                    getattr(coin, "tp3_order_id", None),
-                    getattr(coin, "tp_order_id", None),
-                ])
-                # لو لسه open وما اتحققش TP1: نلغي TP2/TP3 ونسيب TP1 يتحقق جزئياً أو نلغي الكل ونعتمد runner
-                if has_open_tp or status in ("open", "tp1_hit"):
-                    cancelled_any = False
-                    for oid_key in ("tp2_order_id", "tp3_order_id", "tp_order_id"):
-                        # في وضع البامب: بعد ربح 6% نلغي TP2/TP3 دائماً؛ TP1 يبقى لو لسه open
-                        if status != "open" and oid_key == "tp1_order_id":
-                            continue
-                        oid = getattr(coin, oid_key, None)
-                        if oid:
-                            try:
-                                self.client.cancel_order(oid, symbol)
-                                cancelled_any = True
-                            except Exception:
-                                pass
-                    if status == "open":
-                        # بعد 6% ربح: كمان نلغي TP1 الثابت ونحوّل الباقي لـ runner
-                        oid1 = getattr(coin, "tp1_order_id", None)
-                        if oid1:
-                            try:
-                                self.client.cancel_order(oid1, symbol)
-                                cancelled_any = True
-                            except Exception:
-                                pass
-                    if cancelled_any:
-                        # حماية: استوب على الأقل عند الدخول أو أعلى
-                        protect = float(coin.current_sl_price or 0)
-                        if protect < entry_px:
-                            protect = entry_px
-                        trail_pct = PUMP_STRONG_TRAIL_PCT if strong_pump else PUMP_TRAIL_PCT
-                        trail_sl = trailing_stop_price(
-                            price, protect, atr=0.0, min_trail_pct=trail_pct,
-                        )
-                        actions.append({
-                            "coin_id": getattr(coin, "id", None),
-                            "symbol": symbol,
-                            "action": "pump_mode",
-                            "price": price,
-                            "gain_pct": gain_pct,
-                            "new_sl": max(protect, trail_sl),
-                            "trail_pct": trail_pct,
-                            "clear_tp_orders": True,
-                        })
-                        # استوب check later this cycle uses DB old SL; trail applies next updates
-
-                # Trailing أوسع طالما البامب شغال (حتى قبل/بعد TP)
-                sl_now = float(coin.current_sl_price or 0)
-                # أرضية الحماية: دخول، وبعد TP2 مستوى الهدف 1
-                floor = entry_px
-                if status == "tp2_hit":
-                    floor = max(floor, float(coin.tp1_price or entry_px))
-                trail_pct = PUMP_STRONG_TRAIL_PCT if strong_pump else PUMP_TRAIL_PCT
-                new_trail = trailing_stop_price(
-                    price, max(sl_now, floor), atr=0.0, min_trail_pct=trail_pct,
-                )
-                if new_trail > sl_now * 1.002 and new_trail >= floor:
-                    actions.append({
-                        "coin_id": getattr(coin, "id", None),
-                        "symbol": symbol,
-                        "action": "trail_update",
-                        "new_sl": new_trail,
-                        "price": price,
-                        "pump": True,
-                        "gain_pct": gain_pct,
-                    })
-
-            # ----- trailing stop after TP2 (normal, non-pump) -----
-            elif status == "tp2_hit":
-                sl_now = float(coin.current_sl_price or 0)
-                new_trail = trailing_stop_price(
-                    price,
-                    sl_now,
-                    atr=0.0,
-                    trail_atr_mult=1.1,
-                    min_trail_pct=DEFAULT_TRAIL_PCT,
-                )
-                if new_trail > sl_now * 1.0015:
-                    actions.append({
-                        "coin_id": getattr(coin, "id", None),
-                        "symbol": symbol,
-                        "action": "trail_update",
-                        "new_sl": new_trail,
-                        "price": price,
-                    })
-
-            # ----- stop loss -----
-            sl = float(coin.current_sl_price or 0)
+            # ----- ضرب الاستوب → بيع -----
             if sl > 0 and price <= sl:
-                for oid in (
-                    getattr(coin, "tp1_order_id", None),
-                    getattr(coin, "tp2_order_id", None),
-                    getattr(coin, "tp3_order_id", None),
-                    getattr(coin, "tp_order_id", None),
-                ):
-                    if oid:
-                        try:
-                            self.client.cancel_order(oid, symbol)
-                        except Exception:
-                            pass
-                amount = self.client.get_free_amount(symbol) * 0.998
                 sold = False
                 dust = False
-                if amount > 0:
+                amount = free_amt * 0.998 if free_amt > 0 else remaining * 0.998
+                if amount > 0 and amount * price >= MIN_POSITION_USDT:
                     try:
-                        order = self.client.create_market_order(
+                        self.client.create_market_order(
                             f"{symbol}/{self.quote}", "sell", amount
                         )
-                        if order is None:
-                            # كمية أقل من الحد الأدنى (dust) — اعتبرها بيعت بدون خطأ
-                            dust = True
-                            sold = True
-                        else:
-                            sold = True
+                        sold = True
                     except Exception as e:
                         actions.append({
                             "coin_id": getattr(coin, "id", None),
@@ -641,17 +373,16 @@ class Rebalancer:
                             "action": "sl_sell_failed",
                             "error": str(e),
                             "price": price,
+                            "sl": sl,
                         })
                         continue
                 else:
-                    # مفيش رصيد حر — اعتبر المركز اتقفل (dust)
                     sold = True
                     dust = True
 
-                was_raised = status in ("tp1_hit", "tp2_hit", "tp3_hit", "tp_hit")
-                already_used = bool(getattr(coin, "reentry_used", False))
-                # Auto re-entry trigger = stop level recovered by REENTRY_RECOVER_PCT
                 trigger = reentry_trigger_price(sl if sl > 0 else price, REENTRY_RECOVER_PCT)
+                # امسح التبريد عشان تدخل تاني بسرعة بعد الضربة
+                self._reentry_cooldown.pop(symbol, None)
                 actions.append({
                     "coin_id": getattr(coin, "id", None),
                     "symbol": symbol,
@@ -661,11 +392,62 @@ class Rebalancer:
                     "amount": amount,
                     "sold": sold,
                     "dust": dust,
-                    "was_raised": was_raised,
+                    "was_raised": sl >= entry * 0.999 if entry > 0 else False,
                     "reentry_price": trigger,
-                    "reentry_available": bool(trigger > 0 and not already_used),
+                    "reentry_available": True,   # دايماً متاح
                     "auto_reentry": True,
+                    "repeatable": True,
                 })
+                continue
+
+            # ----- Trailing: ارفع الاستوب مع السعر -----
+            if entry <= 0:
+                continue
+
+            gain_pct = ((price / entry) - 1.0) * 100.0
+
+            # اختيار مسافة الـ trail حسب قوة الحركة
+            if gain_pct >= PUMP_STRONG_GAIN_PCT:
+                trail_pct = PUMP_STRONG_TRAIL_PCT
+                mode = "pump_strong"
+            elif gain_pct >= PUMP_GAIN_PCT:
+                trail_pct = PUMP_TRAIL_PCT
+                mode = "pump"
+            else:
+                trail_pct = DEFAULT_TRAIL_PCT
+                mode = "trail"
+
+            # استوب مقترح من السعر الحالي
+            candidate = trailing_stop_price(
+                current_price=price,
+                current_sl=sl if sl > 0 else 0.0,
+                atr=0.0,
+                trail_atr_mult=1.15,
+                min_trail_pct=trail_pct,
+            )
+
+            # قفل break-even بعد ربح BE_LOCK_PCT
+            if gain_pct >= BE_LOCK_PCT:
+                candidate = max(candidate, entry)
+
+            # الاستوب الابتدائي لو لسه مش متعيّن
+            if sl <= 0:
+                candidate = max(candidate, entry * (1.0 - INITIAL_SL_PCT / 100.0))
+
+            # ارفع فقط — عمره ما ينزل
+            if candidate > sl + (price * 0.0003):  # هامش ضئيل ضد الضوضاء
+                actions.append({
+                    "coin_id": getattr(coin, "id", None),
+                    "symbol": symbol,
+                    "action": "trail_update",
+                    "new_sl": candidate,
+                    "old_sl": sl,
+                    "price": price,
+                    "gain_pct": gain_pct,
+                    "mode": mode,
+                    "trail_pct": trail_pct,
+                })
+
         return actions
 
     def reentry_buy_and_place_tp(
