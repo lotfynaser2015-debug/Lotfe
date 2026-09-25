@@ -1047,21 +1047,45 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not p:
                 await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
                 return
-            if p.is_running:
-                await query.edit_message_text(
-                    "⚠️ أوقف المحفظة أولاً قبل تغيير وضع التحكم، ثم أعد بناء المراكز.",
-                    reply_markup=pf_keyboard(pf_id, True),
-                )
-                return
             current = str(getattr(p, "control_mode", "smart") or "smart").lower()
             p.control_mode = "manual" if current != "manual" else "smart"
+            applied = 0
+            # Switching is atomic at the database level and never cancels or sells.
+            # When entering manual mode, seed TP/SL values for already-open coins.
+            if p.control_mode == "manual":
+                user = get_or_create_user(db, tid)
+                def _mode_pct(pf_val, user_val, default):
+                    return float(pf_val) if pf_val is not None and float(pf_val) > 0 else (
+                        float(user_val) if user_val is not None and float(user_val) > 0 else default
+                    )
+                tp1 = _mode_pct(getattr(p, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
+                tp2 = _mode_pct(getattr(p, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
+                tp3 = _mode_pct(getattr(p, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
+                sl_pct = _mode_pct(getattr(p, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
+                p.tp1_pct, p.tp2_pct, p.tp3_pct, p.stop_loss_pct = tp1, tp2, tp3, sl_pct
+                for coin in p.coins:
+                    entry = float(coin.entry_price or 0)
+                    if entry <= 0 or (coin.position_status or "") not in ("open", "tp1_hit", "tp2_hit", "tp3_hit"):
+                        continue
+                    manual_sl = entry * (1.0 - sl_pct / 100.0)
+                    # Never loosen a previously raised/protected stop during a switch.
+                    safe_sl = max(float(coin.current_sl_price or 0), manual_sl)
+                    update_coin_position(
+                        db, coin.id,
+                        tp1_price=entry * (1.0 + tp1 / 100.0),
+                        tp2_price=entry * (1.0 + tp2 / 100.0),
+                        tp3_price=entry * (1.0 + tp3 / 100.0),
+                        current_sl_price=safe_sl,
+                    )
+                    applied += 1
             db.commit()
             mode_name = "يدوي (TP/SL ثابت)" if p.control_mode == "manual" else "ذكي (ATR + Trailing)"
             await query.edit_message_text(
                 f"✅ تم اختيار وضع: *{mode_name}*\n\n"
-                "أعد تشغيل المحفظة أو استخدم إعادة بناء المراكز لتطبيق الوضع على المراكز.",
+                f"تم تطبيق الوضع على `{applied}` مركز مفتوح.\n"
+                "لم يتم إيقاف المحفظة أو بيع أي عملة.",
                 parse_mode="Markdown",
-                reply_markup=pf_keyboard(pf_id, False),
+                reply_markup=pf_keyboard(pf_id, p.is_running),
             )
         finally:
             db.close()
