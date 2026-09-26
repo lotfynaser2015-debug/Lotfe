@@ -1130,9 +1130,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "tp1_order_id": getattr(c, "tp1_order_id", None),
                         "tp2_order_id": getattr(c, "tp2_order_id", None),
                         "tp3_order_id": getattr(c, "tp3_order_id", None),
-                        "tp1_sell_pct_override": s1 if (c.position_status or "") == "open" else 0.0,
-                        "tp2_sell_pct_override": s2 if (c.position_status or "") == "open" else (50.0 if (c.position_status or "") == "tp1_hit" else 0.0),
-                        "place_exchange_orders": True,
                     }
                     for c in open_coins
                 ]
@@ -2595,20 +2592,8 @@ async def _do_stop(query, tid, pf_id):
                     logger.exception("record stop trade %s", sym)
             await asyncio.sleep(0.25)
 
-        from database import reset_coin_positions, update_coin_position
-        if not fail_symbols:
-            reset_coin_positions(db, pf_id)
-        else:
-            # Keep failed-to-sell rows tracked so a retry can recover them.
-            failed_set = {str(item).split(":", 1)[0].strip() for item in fail_symbols}
-            for c in coins:
-                if c.symbol not in failed_set:
-                    update_coin_position(
-                        db, c.id, position_status="closed",
-                        current_sl_price=0.0, remaining_amount=0.0, amount=0.0,
-                        tp_order_id=None, tp1_order_id=None,
-                        tp2_order_id=None, tp3_order_id=None,
-                    )
+        from database import reset_coin_positions
+        reset_coin_positions(db, pf_id)
         set_portfolio_running(db, pf_id, False)
         log_action(
             db, tid, "stop",
@@ -3381,6 +3366,11 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
         positions = get_open_positions(db)
         if not positions:
             return
+        logger.info(
+            "[MONITOR] open_positions=%s symbols=%s",
+            len(positions),
+            ",".join(sorted({c.symbol for c in positions})[:30]),
+        )
         # Run sync CCXT work off the event loop so Telegram stays responsive
         loop = asyncio.get_event_loop()
         reb = get_reb()
@@ -3391,6 +3381,12 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
             None, lambda: reb.check_and_manage_positions(positions)
         )
         actions = exchange_tp_actions + price_actions
+        if actions:
+            logger.info(
+                "[MONITOR] actions=%s types=%s",
+                len(actions),
+                ",".join(a.get("action", "?") for a in actions),
+            )
         trail_batches = {}  # tid -> list of meaningful trail updates
         for act in actions:
             symbol = act["symbol"]

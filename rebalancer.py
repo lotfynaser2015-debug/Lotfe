@@ -9,6 +9,22 @@ from smart_levels import (
 
 logger = logging.getLogger(__name__)
 
+
+def log_trade(event: str, symbol: str = "", **kwargs):
+    """لوج موحّد يظهر في Railway عند أي حدث تداول مهم."""
+    parts = [f"[TRADE] {event}"]
+    if symbol:
+        parts.append(f"symbol={symbol}")
+    for k, v in kwargs.items():
+        if v is None:
+            continue
+        if isinstance(v, float):
+            parts.append(f"{k}={v:.6g}")
+        else:
+            parts.append(f"{k}={v}")
+    logger.info(" | ".join(parts))
+
+
 # ===== نظام الوقف المتحرك (Trailing Stop) — بدون أهداف ثابتة =====
 # الاستوب الابتدائي تحت الدخول
 INITIAL_SL_PCT = 3.0
@@ -701,6 +717,25 @@ class Rebalancer:
                     "trail_pct": trail_pct,
                 })
 
+        if actions:
+            log_trade(
+                "cycle_summary",
+                count=len(actions),
+                types=",".join(sorted({a.get("action", "?") for a in actions})),
+            )
+            for a in actions:
+                log_trade(
+                    a.get("action", "unknown"),
+                    a.get("symbol", ""),
+                    price=a.get("price"),
+                    sl=a.get("sl") or a.get("new_sl") or a.get("old_sl"),
+                    amount=a.get("amount") or a.get("filled_amount"),
+                    mode=a.get("mode"),
+                    gain=a.get("gain_pct"),
+                    error=a.get("error"),
+                    silent=a.get("silent"),
+                    stage=a.get("stage"),
+                )
         return actions
 
     def reentry_buy_and_place_tp(
