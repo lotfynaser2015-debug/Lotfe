@@ -2449,54 +2449,190 @@ async def _do_start(query, tid, pf_id):
 
 
 async def _do_stop(query, tid, pf_id):
+    """إيقاف المحفظة: إلغاء الأوامر + بيع كل العملات بسعر السوق."""
+    import asyncio
+
     db = SessionLocal()
     try:
         p = get_portfolio(db, pf_id, tid)
         if not p:
             await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
             return
-        coins = [c.symbol for c in p.coins]
-        await query.edit_message_text("⏳ جاري الإيقاف (إلغاء أوامر الهدف + بيع)...")
-
-        # Cancel any open TP limit orders on MEXC
-        tp_orders = []
-        for c in p.coins:
-            tp_orders.append({
-                "symbol": c.symbol,
-                "tp_order_id": getattr(c, "tp_order_id", None),
-                "tp1_order_id": getattr(c, "tp1_order_id", None),
-                "tp2_order_id": getattr(c, "tp2_order_id", None),
-                "tp3_order_id": getattr(c, "tp3_order_id", None),
-            })
-        get_reb().cancel_tp_orders(tp_orders)
-
-        stop_result = get_reb().stop_portfolio(coins, dry_run=False) if coins else {"executed": []}
-        for sold in stop_result.get("executed", []):
-            symbol = str(sold.get("symbol", "")).split("/")[0]
-            coin = next((c for c in p.coins if c.symbol == symbol), None)
-            amount = float(sold.get("amount") or 0)
-            usdt = float(sold.get("usdt") or 0)
-            exit_price = usdt / amount if amount > 0 else 0.0
-            if coin and amount > 0 and float(coin.entry_price or 0) > 0:
-                record_trade_event(
-                    db, tid, p.id, coin.id, symbol, "manual_stop",
-                    coin.entry_price, exit_price, amount,
-                    (exit_price - coin.entry_price) * amount,
-                    details="Manual portfolio stop",
-                )
-
-        from database import reset_coin_positions
-        reset_coin_positions(db, pf_id)
-        set_portfolio_running(db, pf_id, False)
-        log_action(db, tid, "stop", f"Stopped {p.name}", True, pf_id)
+        coins = list(p.coins)
+        symbols = [c.symbol for c in coins]
         await query.edit_message_text(
-            f"⏹ تم إيقاف *{p.name}*\nتم إلغاء أوامر الهدف وبيع العملات.\nالمحفظة محفوظة.",
+            f"⏳ جاري إيقاف *{p.name}*...\n"
+            "1) إلغاء أوامر البيع\n"
+            "2) بيع كل العملات بسعر السوق",
+            parse_mode="Markdown",
+        )
+
+        client = get_mexc()
+        loop = asyncio.get_event_loop()
+        notes = []
+        cancelled_count = 0
+        sold_total = 0.0
+        sold_symbols = []
+        fail_symbols = []
+
+        # 1) إلغاء أوامر TP + كل أوامر البيع المفتوحة لكل عملة
+        def _cancel_phase():
+            n = 0
+            errs = []
+            for c in coins:
+                sym = c.symbol
+                for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
+                    oid = getattr(c, key, None)
+                    if not oid:
+                        continue
+                    try:
+                        client.cancel_order(str(oid), sym, strict=False)
+                        n += 1
+                    except Exception as exc:
+                        logger.warning("stop cancel %s %s: %s", sym, oid, exc)
+                try:
+                    extra = client.cancel_all_open_sells(sym)
+                    n += len(extra.get("cancelled") or [])
+                    for e in (extra.get("errors") or []):
+                        errs.append(f"{sym}: {e}")
+                except Exception as exc:
+                    errs.append(f"{sym}: {exc}")
+            return n, errs
+
+        try:
+            cancelled_count, cerrs = await loop.run_in_executor(None, _cancel_phase)
+            notes.extend(cerrs[:5])
+        except Exception as exc:
+            logger.exception("stop cancel phase")
+            notes.append(ar_error(exc, "إلغاء الأوامر"))
+
+        await asyncio.sleep(1.5)
+
+        # رموز موجودة في محافظ شغّالة أخرى (حماية الرصيد المشترك)
+        shared = set()
+        for c in coins:
+            other = db.query(PortfolioCoin).join(Portfolio).filter(
+                PortfolioCoin.symbol == c.symbol,
+                PortfolioCoin.portfolio_id != p.id,
+                Portfolio.telegram_id == tid,
+                Portfolio.status == "active",
+                Portfolio.is_running == True,
+            ).first()
+            if other:
+                shared.add(c.symbol)
+
+        # 2) بيع كل عملة
+        def _sell_one(sym, tracked, is_shared):
+            free = float(client.get_free_amount(sym) or 0)
+            total = float(client.get_total_amount(sym) or 0)
+            if is_shared and tracked > 0:
+                amount = min(tracked * 0.998, free if free > 0 else total)
+            else:
+                amount = (free if free > 0 else total) * 0.998
+            if amount <= 0:
+                return {"ok": True, "dust": True, "usdt": 0.0, "amount": 0.0}
+            try:
+                px = float(client.get_ticker_price(f"{sym}/{client.quote}") or 0)
+                order = client.create_market_order(f"{sym}/{client.quote}", "sell", amount)
+                if order is None:
+                    return {"ok": True, "dust": True, "usdt": 0.0, "amount": amount}
+                return {
+                    "ok": True,
+                    "dust": False,
+                    "usdt": amount * px,
+                    "amount": amount,
+                    "price": px,
+                    "order_id": order.get("id"),
+                }
+            except Exception as e:
+                return {"ok": False, "error": str(e), "usdt": 0.0, "amount": amount}
+
+        for c in coins:
+            sym = c.symbol
+            tracked = float(c.remaining_amount or c.amount or 0)
+            try:
+                res = await loop.run_in_executor(None, lambda s=sym, t=tracked, sh=(sym in shared): _sell_one(s, t, sh))
+            except Exception as exc:
+                logger.exception("stop sell %s", sym)
+                fail_symbols.append(f"{sym}: {exc}")
+                continue
+            if not res.get("ok"):
+                fail_symbols.append(f"{sym}: {res.get('error')}")
+                logger.error("stop sell failed %s: %s", sym, res.get("error"))
+                continue
+            amt = float(res.get("amount") or 0)
+            usdt = float(res.get("usdt") or 0)
+            if amt > 0 and usdt > 0:
+                sold_total += usdt
+                sold_symbols.append(sym)
+                entry = float(c.entry_price or 0)
+                px = float(res.get("price") or (usdt / amt if amt else 0))
+                pnl = (px - entry) * amt if entry > 0 else 0
+                try:
+                    record_trade_event(
+                        db, tid, p.id, c.id, sym, "manual_stop",
+                        entry, px, amt, pnl,
+                        details="إيقاف المحفظة — بيع سوق",
+                    )
+                except Exception:
+                    logger.exception("record stop trade %s", sym)
+            await asyncio.sleep(0.25)
+
+        from database import reset_coin_positions, update_coin_position
+        if not fail_symbols:
+            reset_coin_positions(db, pf_id)
+        else:
+            # Keep failed-to-sell rows tracked so a retry/rebuild can recover
+            # them instead of silently losing unsold balances from the DB.
+            failed_set = {str(item).split(":", 1)[0].strip() for item in fail_symbols}
+            for c in coins:
+                if c.symbol not in failed_set:
+                    update_coin_position(
+                        db, c.id, position_status="closed",
+                        current_sl_price=0.0, remaining_amount=0.0, amount=0.0,
+                        tp_order_id=None, tp1_order_id=None,
+                        tp2_order_id=None, tp3_order_id=None,
+                    )
+        set_portfolio_running(db, pf_id, False)
+        log_action(
+            db, tid, "stop",
+            f"Stopped {p.name} sold={sold_total:.2f} fails={len(fail_symbols)}",
+            len(fail_symbols) == 0,
+            pf_id,
+        )
+
+        lines = [
+            f"⏹ *تم إيقاف {p.name}*",
+            f"أوامر ملغاة: `{cancelled_count}`",
+            f"تم البيع ≈ `{sold_total:.2f}` USDT",
+            f"عملات بيعت: `{len(sold_symbols)}` / `{len(symbols)}`",
+            "المحفظة محفوظة (متوقفة).",
+        ]
+        if fail_symbols:
+            lines.append("\n⚠️ فشل بيع:")
+            lines.extend(f"• {x}" for x in fail_symbols[:10])
+            lines.append("راجع الرصيد على MEXC وأعد المحاولة إن لزم.")
+            logger.error("portfolio stop partial failures pf=%s: %s", pf_id, fail_symbols)
+        if notes:
+            lines.append("\nملاحظات إلغاء: " + " | ".join(str(n) for n in notes[:3]))
+
+        await query.edit_message_text(
+            "\n".join(lines),
             parse_mode="Markdown",
             reply_markup=pf_keyboard(pf_id, False),
         )
+    except Exception as exc:
+        logger.exception("do_stop fatal")
+        try:
+            await query.edit_message_text(
+                f"❌ {ar_error(exc, 'إيقاف المحفظة')}",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception:
+            pass
     finally:
         db.close()
-
 
 
 async def _do_remove_coin(query, tid, pf_id, symbol):
