@@ -19,8 +19,14 @@ from telegram.ext import (
 )
 
 import config
+import sniper_session
+from sniper_session import (
+    settings_from_db_row, start_sniper, stop_sniper, status_text as sniper_status_text,
+    tick as sniper_tick, get_runtime as get_sniper_runtime,
+)
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
+    get_sniper_config, update_sniper_config,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
     close_portfolio, delete_portfolio_completely, clear_coin_position,
     delete_orphaned_portfolio_records,
@@ -122,6 +128,7 @@ def main_menu_keyboard():
             InlineKeyboardButton("📋 محافظي", callback_data="list_pf"),
             InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf"),
         ],
+        [InlineKeyboardButton("🎯 السنايبر (اقتناص)", callback_data="sniper_menu")],
         [InlineKeyboardButton("📡 حالة السوق", callback_data="auto_sys_status")],
         [InlineKeyboardButton("💰 الرصيد", callback_data="balance")],
         [
@@ -600,6 +607,77 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("waiting"):
         # تعديل إعدادات عامة
+        sniper_field = context.user_data.get("edit_sniper_field")
+        if sniper_field:
+            try:
+                if sniper_field == "watchlist":
+                    raw = text.strip()
+                    if raw in ("افتراضي", "default", "DEFAULT"):
+                        from sniper_session import DEFAULT_WATCHLIST
+                        coins = list(DEFAULT_WATCHLIST)
+                    else:
+                        coins = []
+                        for part in raw.replace("\n", ",").replace(" ", ",").split(","):
+                            sym = part.strip().upper().replace("/USDT", "")
+                            if sym and sym.isalnum() and 1 < len(sym) <= 15:
+                                if sym not in coins:
+                                    coins.append(sym)
+                    if not coins:
+                        await update.message.reply_text("لم أتعرف على أي رموز. مثال: BTC,ETH,SEI")
+                        return
+                    if len(coins) > 80:
+                        await update.message.reply_text("الحد الأقصى 80 عملة.")
+                        return
+                    wl = ",".join(coins)
+                    db = SessionLocal()
+                    try:
+                        update_sniper_config(db, update.effective_user.id, watchlist=wl)
+                        cfg = get_sniper_config(db, update.effective_user.id)
+                        rt = get_sniper_runtime()
+                        if not rt.active:
+                            rt.settings = settings_from_db_row(cfg)
+                        else:
+                            rt.settings.watchlist = coins
+                    finally:
+                        db.close()
+                    context.user_data.pop("edit_sniper_field", None)
+                    context.user_data.pop("waiting", None)
+                    await update.message.reply_text(
+                        f"✅ سلة السنايبر: *{len(coins)}* عملة\n`{', '.join(coins[:25])}`"
+                        + ("…" if len(coins) > 25 else ""),
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                    return
+
+                val = float(text.strip().replace("%", "").replace(",", ".").replace("$", ""))
+                if val < 0 or val > 10000:
+                    await update.message.reply_text("أدخل رقمًا منطقيًا.")
+                    return
+                if sniper_field == "sessions_planned":
+                    val = max(1, min(10, int(val)))
+                if sniper_field == "max_positions":
+                    val = max(1, min(3, int(val)))
+                db = SessionLocal()
+                try:
+                    update_sniper_config(db, update.effective_user.id, **{sniper_field: val})
+                    cfg = get_sniper_config(db, update.effective_user.id)
+                    rt = get_sniper_runtime()
+                    if not rt.active:
+                        rt.settings = settings_from_db_row(cfg)
+                finally:
+                    db.close()
+                context.user_data.pop("edit_sniper_field", None)
+                context.user_data.pop("waiting", None)
+                await update.message.reply_text(
+                    f"✅ تم تحديث السنايبر: `{sniper_field}` = `{val}`",
+                    parse_mode="Markdown",
+                    reply_markup=main_menu_keyboard(),
+                )
+            except Exception as e:
+                await update.message.reply_text(f"خطأ: {e}")
+            return
+
         user_field = context.user_data.get("edit_user_tpsl")
         if user_field:
             try:
@@ -729,6 +807,151 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "لإيقاف الإدارة: داخل المحفظة → *⏹ إيقاف المحفظة*.",
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # ========== السنايبر ==========
+    if data == "sniper_menu":
+        db = SessionLocal()
+        try:
+            cfg = get_sniper_config(db, tid)
+            s = settings_from_db_row(cfg)
+            rt = get_sniper_runtime()
+            if not rt.active:
+                rt.settings = s
+            text = sniper_status_text()
+            rows = []
+            if not rt.active:
+                rows.append([InlineKeyboardButton("▶️ بدء الجلسات", callback_data="sniper_start")])
+            else:
+                rows.append([InlineKeyboardButton("⏹ إيقاف السنايبر", callback_data="sniper_stop")])
+            rows.append([
+                InlineKeyboardButton("تارجت $", callback_data="sniper_set_target_usdt"),
+                InlineKeyboardButton("وقف $", callback_data="sniper_set_stop_usdt"),
+            ])
+            rows.append([
+                InlineKeyboardButton("حجم أدنى", callback_data="sniper_set_min_size_usdt"),
+                InlineKeyboardButton("حجم أقصى", callback_data="sniper_set_max_size_usdt"),
+            ])
+            rows.append([
+                InlineKeyboardButton("عدد الجلسات", callback_data="sniper_set_sessions_planned"),
+                InlineKeyboardButton("أقصى مراكز", callback_data="sniper_set_max_positions"),
+            ])
+            rows.append([InlineKeyboardButton("📝 سلة العملات", callback_data="sniper_watchlist")])
+            rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="sniper_menu")])
+            rows.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu")])
+            await query.edit_message_text(
+                text, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+        finally:
+            db.close()
+        return
+
+    if data == "sniper_start":
+        db = SessionLocal()
+        try:
+            running = [p for p in get_portfolios(db, tid, status="active") if p.is_running]
+            if running:
+                names = ", ".join(p.name for p in running[:5])
+                await query.edit_message_text(
+                    f"⚠️ في محافظ شغّالة: *{names}*\n"
+                    "أوقفها أولاً، أو أكّد البدء مع التحذير.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ بدء رغم ذلك", callback_data="sniper_start_force")],
+                        [InlineKeyboardButton("⬅️ رجوع", callback_data="sniper_menu")],
+                    ]),
+                )
+                return
+            cfg = get_sniper_config(db, tid)
+            s = settings_from_db_row(cfg)
+            msg = start_sniper(tid, s)
+            log_action(db, tid, "sniper_start", "start", True)
+            await query.edit_message_text(
+                msg, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏹ إيقاف", callback_data="sniper_stop")],
+                    [InlineKeyboardButton("🔄 حالة", callback_data="sniper_menu")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
+
+    if data == "sniper_start_force":
+        db = SessionLocal()
+        try:
+            cfg = get_sniper_config(db, tid)
+            s = settings_from_db_row(cfg)
+            msg = start_sniper(tid, s)
+            await query.edit_message_text(
+                msg + "\n\n⚠️ *بدء مع محافظ شغّالة*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏹ إيقاف", callback_data="sniper_stop")],
+                    [InlineKeyboardButton("🔄 حالة", callback_data="sniper_menu")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
+
+    if data == "sniper_stop":
+        msg = stop_sniper(get_mexc(), reason="manual")
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎯 السنايبر", callback_data="sniper_menu")],
+                [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
+            ]),
+        )
+        return
+
+
+    if data == "sniper_watchlist":
+        db = SessionLocal()
+        try:
+            cfg = get_sniper_config(db, tid)
+            s = settings_from_db_row(cfg)
+            coins = ", ".join(s.watchlist)
+            # اختصار للعرض
+            preview = coins if len(coins) < 800 else (coins[:800] + "…")
+            context.user_data["waiting"] = True
+            context.user_data["edit_sniper_field"] = "watchlist"
+            await query.edit_message_text(
+                "📝 *سلة عملات السنايبر*\n\n"
+                f"الحالية ({len(s.watchlist)}):\n`{preview}`\n\n"
+                "أرسل القائمة الجديدة مفصولة بفاصلة:\n"
+                "مثال:\n`BTC,ETH,SOL,SEI,FET,TIA`\n\n"
+                "أو أرسل `افتراضي` لإرجاع القائمة الأصلية.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ رجوع", callback_data="sniper_menu")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
+
+    if data.startswith("sniper_set_"):
+        field = data[len("sniper_set_"):]
+        labels = {
+            "target_usdt": "تارجت الجلسة بالدولار (مثال: 5)",
+            "stop_usdt": "وقف الجلسة بالدولار (مثال: 5)",
+            "min_size_usdt": "أقل حجم صفقة $",
+            "max_size_usdt": "أقصى حجم صفقة $",
+            "sessions_planned": "عدد الجلسات المتتالية (1–10)",
+            "max_positions": "أقصى مراكز مفتوحة (1–3)",
+        }
+        context.user_data["waiting"] = True
+        context.user_data["edit_sniper_field"] = field
+        await query.edit_message_text(
+            f"أرسل قيمة *{labels.get(field, field)}*:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="sniper_menu")],
+            ]),
         )
         return
 
@@ -3358,6 +3581,28 @@ async def smart_levels_refresh_job(context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
+
+async def sniper_job(context: ContextTypes.DEFAULT_TYPE):
+    """دورة السنايبر — منفصلة عن مراقبة المحافظ."""
+    import asyncio
+    rt = get_sniper_runtime()
+    if not rt.active:
+        return
+    try:
+        loop = asyncio.get_event_loop()
+        msgs = await loop.run_in_executor(None, lambda: sniper_tick(get_mexc()))
+        for m in msgs:
+            tid = rt.telegram_id
+            if not tid:
+                continue
+            try:
+                await context.bot.send_message(tid, m["text"], parse_mode="Markdown")
+            except Exception:
+                logger.exception("sniper notify fail")
+    except Exception:
+        logger.exception("sniper_job error")
+
+
 async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
     """Background job: check open positions for TP fill / SL hit / re-entry."""
     import asyncio
@@ -3859,6 +4104,13 @@ def main():
 
     # Cloud monitor for TP/SL every 25 seconds
     if app.job_queue:
+        app.job_queue.run_repeating(
+            sniper_job,
+            interval=45,
+            first=20,
+            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
+        )
+        logger.info("Sniper job scheduled (every 45s)")
         app.job_queue.run_repeating(
             monitor_positions_job,
             interval=60,
