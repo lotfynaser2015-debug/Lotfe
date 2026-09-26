@@ -175,7 +175,7 @@ class Rebalancer:
         return results
 
     def cancel_tp_orders(self, coins_data: List[Dict[str, Any]]) -> Dict:
-        """Cancel only TP order IDs owned by these portfolio rows."""
+        """Cancel TP order IDs; أوامر منتهية مسبقاً لا تُعتبر فشلاً."""
         result = {"cancelled": [], "errors": []}
         for item in coins_data:
             symbol = item.get("symbol")
@@ -184,10 +184,16 @@ class Rebalancer:
                 if not order_id:
                     continue
                 try:
-                    self.client.cancel_order(order_id, f"{symbol}/{self.quote}", strict=True)
+                    # strict=False: filled/cancelled مسبقاً → نجاح صامت
+                    self.client.cancel_order(order_id, f"{symbol}/{self.quote}", strict=False)
                     result["cancelled"].append(order_id)
                 except Exception as exc:
-                    result["errors"].append({"symbol": symbol, "order_id": order_id, "error": str(exc)})
+                    msg = str(exc).lower()
+                    if any(x in msg for x in ("not found", "unknown", "already", "filled", "canceled", "cancelled")):
+                        result["cancelled"].append(order_id)
+                    else:
+                        result["errors"].append({"symbol": symbol, "order_id": order_id, "error": str(exc)})
+                        logger.warning("cancel_tp %s %s: %s", symbol, order_id, exc)
         return result
 
     def place_tp_orders(

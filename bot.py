@@ -180,106 +180,88 @@ def _missing_reentry_keyboard(pf_id: int, missing_symbols, selected, allow_selec
 
 
 def format_pf(p, current_value: float = None, prices: dict = None, events=None) -> str:
-    """عرض محفظة بربح/خسارة حقيقية (من سعر الدخول + المحقق).
-
-    مش بيقارن قيمة الباقي بالمخصص الأصلي — ده كان بيظهر خسارة وهمية بعد البيع.
-    """
+    """عرض مبسّط: الربح/الخسارة من أساس آخر إعادة بناء."""
     status = "🟢 شغالة" if p.is_running else "⚪ متوقفة"
-    mode = "يدوي: أهداف + وقف ثابت" if str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual" else "ذكي: مستويات + وقف متحرك"
-    allocated = float(p.investment_usdt or 0)
+    mode = (
+        "يدوي: أهداف + وقف ثابت"
+        if str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual"
+        else "ذكي: وقف متحرك"
+    )
     prices = prices or {}
     events = events or []
 
-    # --- مراكز مفتوحة: تكلفة الدخول vs القيمة الحالية ---
-    open_cost = 0.0
+    # القيمة السوقية الحالية للمراكز المفتوحة
     open_value = 0.0
-    open_count = 0
     for coin in p.coins:
-        status_c = (coin.position_status or "idle")
-        if status_c not in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
-            # لو لسه فيه كمية متبقية نعتبرها مفتوحة
-            rem = float(coin.remaining_amount or coin.amount or 0)
-            entry = float(coin.entry_price or 0)
-            if rem <= 0 or entry <= 0:
-                continue
-        else:
-            rem = float(coin.remaining_amount or coin.amount or 0)
-            entry = float(coin.entry_price or 0)
-            if rem <= 0 or entry <= 0:
-                continue
+        rem = float(coin.remaining_amount or coin.amount or 0)
+        if rem <= 0:
+            continue
         px = float(prices.get(coin.symbol) or 0)
-        if px <= 0 and current_value is not None:
-            # prices dict may be incomplete
-            pass
         if px <= 0:
-            px = entry
-        open_cost += entry * rem
-        open_value += px * rem
-        open_count += 1
+            px = float(coin.entry_price or 0)
+        open_value += rem * px
 
-    # لو current_value اتبعت من المنصة (رصيد فعلي) استخدمه للقيمة
     if current_value is not None and current_value >= 0:
-        # استخدم الرصيد الفعلي كقيمة، والتكلفة من الدخول للكمية المتبقية
-        if open_cost > 0:
-            open_value = float(current_value)
-        elif float(current_value or 0) > 0 and open_cost <= 0:
-            open_value = float(current_value)
+        open_value = float(current_value)
 
-    unrealized = open_value - open_cost if open_cost > 0 else 0.0
-    unrealized_pct = ((open_value / open_cost) - 1.0) * 100.0 if open_cost > 0 else 0.0
+    # أساس الحساب = آخر إعادة بناء (base_investment)، وإلا المخصص
+    baseline = float(getattr(p, "base_investment", 0) or 0)
+    if baseline <= 0:
+        baseline = float(p.investment_usdt or 0)
 
-    realized = sum(float(getattr(e, "realized_pnl", 0) or 0) for e in events)
-    total_pnl = realized + unrealized
-    total_basis = open_cost + abs(min(realized, 0))  # rough
-    # نسبة الإجمالي على المخصص فقط لو لسه في مراكز أو في محقق
-    if open_cost > 0:
-        total_pct = (total_pnl / open_cost) * 100.0
-    elif allocated > 0 and (realized != 0 or open_value > 0):
-        total_pct = (total_pnl / allocated) * 100.0
-    else:
-        total_pct = 0.0
+    # محقق منذ آخر إعادة بناء فقط
+    rebuild_at = getattr(p, "last_rebalance", None)
+    realized = 0.0
+    for e in events:
+        if rebuild_at is not None:
+            created = getattr(e, "created_at", None)
+            if created is not None and created < rebuild_at:
+                continue
+        realized += float(getattr(e, "realized_pnl", 0) or 0)
+
+    # غير المحقق ≈ القيمة الآن − (الأساس − المحقق)
+    # تفسير أبسط: الإجمالي من الأساس = (القيمة الآن + المحقق) − الأساس
+    # لأن المحقق خرج كـ USDT من المراكز
+    equity_now = open_value + max(realized, 0)  # rough if realized positive already cashed
+    # أدق: الربح الإجمالي = (قيمة مفتوحة − تكلفة متبقية تقديرية) + محقق
+    # المستخدم طلب: من آخر إعادة بناء
+    # عند إعادة البناء: baseline = قيمة المراكز وقتها
+    # الآن: pnl = open_value - baseline + realized_since
+    total_pnl = (open_value - baseline) + realized
+    total_pct = (total_pnl / baseline * 100.0) if baseline > 0 else 0.0
 
     symbols = [c.symbol for c in p.coins]
     if symbols:
         rows = []
         for i in range(0, len(symbols), 3):
             chunk = symbols[i:i + 3]
-            cells = [f"▣ *{s}*" for s in chunk]
-            rows.append("   ".join(cells))
+            rows.append("   ".join(f"▣ *{s}*" for s in chunk))
         coins_block = "\n".join(rows)
     else:
         coins_block = "—"
+
+    t_emoji = "🟢" if total_pnl >= 0 else "🔴"
+    rebuild_txt = ""
+    if rebuild_at is not None:
+        try:
+            rebuild_txt = f"\nآخر إعادة بناء: `{rebuild_at.strftime('%Y-%m-%d %H:%M')}` UTC"
+        except Exception:
+            pass
 
     out = [
         f"📁 *{p.name}*  `#{p.id}`",
         "━━━━━━━━━━━━━━━━━━━━",
         f"الحالة: *{status}*",
         f"التحكم: *{mode}*",
-        f"المخصص الأصلي: *{allocated:.2f}* USDT",
+        f"أساس آخر إعادة بناء: *{baseline:.2f}* USDT",
+        f"القيمة الآن: *{open_value:.2f}* USDT",
+        f"{t_emoji} الربح/الخسارة: *{total_pnl:+.2f}* USDT (*{total_pct:+.2f}%*)",
     ]
-    out.append(f"قيمة المراكز المفتوحة: *{open_value:.2f}* USDT")
-    if open_cost > 0:
-        out.append(f"تكلفة الدخول (المتبقي): *{open_cost:.2f}* USDT")
-
-    u_emoji = "🟢" if unrealized >= 0 else "🔴"
-    r_emoji = "🟢" if realized >= 0 else "🔴"
-    t_emoji = "🟢" if total_pnl >= 0 else "🔴"
-
-    if open_cost > 0 or open_count > 0:
-        out.append(
-            f"{u_emoji} غير المحقق: *{unrealized:+.2f}* USDT (*{unrealized_pct:+.2f}%*)"
-        )
-    if events:
-        out.append(f"{r_emoji} المحقق: *{realized:+.2f}* USDT")
-        out.append(f"{t_emoji} *الإجمالي: {total_pnl:+.2f} USDT*")
-    elif open_cost > 0:
-        out.append(
-            f"{t_emoji} الربح/الخسارة: *{unrealized:+.2f}* USDT (*{unrealized_pct:+.2f}%*)"
-        )
-    elif current_value is not None and allocated > 0 and open_value < 1.0:
-        # مفيش مراكز مفتوحة تقريبًا — المخصص اتحول لسيولة بعد البيع
-        out.append("_المراكز مغلقة/مباعة — راجع الإحصائيات للمحقق_")
-
+    if abs(realized) > 0.0001:
+        r_emoji = "🟢" if realized >= 0 else "🔴"
+        out.append(f"{r_emoji} منه محقق (بيعات): *{realized:+.2f}* USDT")
+    if rebuild_txt:
+        out.append(rebuild_txt.strip())
     out.append("")
     out.append(f"*العملات* ({len(symbols)})")
     out.append(coins_block)
@@ -1649,6 +1631,27 @@ async def _do_rebuild_positions(query, tid, pf_id):
             except Exception as exc:
                 refresh_errors.append(f"{coin.symbol}: {exc}")
 
+        # أساس حقيقي للحساب من الآن = قيمة المراكز بعد إعادة البناء
+        try:
+            from datetime import datetime as _dt
+            final_value = 0.0
+            for coin in p.coins:
+                rem = float(coin.remaining_amount or coin.amount or 0)
+                entry = float(coin.entry_price or 0)
+                if rem > 0 and entry > 0:
+                    try:
+                        px = float(client.get_ticker_price(f"{coin.symbol}/{client.quote}") or entry)
+                    except Exception:
+                        px = entry
+                    final_value += rem * px
+            if final_value <= 0:
+                final_value = float(total_value or p.investment_usdt or 0)
+            p.base_investment = final_value
+            p.last_rebalance = _dt.utcnow()
+            db.commit()
+        except Exception:
+            logger.exception("failed to set rebuild baseline")
+
         log_action(
             db, tid, "rebuild_positions",
             f"Rebuild {p.name}: target={target_per_coin:.2f} cancel={cancelled_count} "
@@ -1668,8 +1671,8 @@ async def _do_rebuild_positions(query, tid, pf_id):
             f"🛒 عملات جديدة: `{len(bought)}`" + (f" — {', '.join(f'`{x}`' for x in bought)}" if bought else ""),
             f"📈 تم تكميل: `{len(topped)}`" + (f" — {', '.join(f'`{x}`' for x in topped[:8])}" if topped else ""),
             f"💵 صُرف من الحساب: `{total_spent:.2f}$` | USDT متبقي: `{free_after:.2f}$`",
-            f"🎯 أهداف ذكية وُضعت لـ: `{len(refreshed)}` عملة",
-            "(كل عملة حسب ATR والاتجاه — مع حد أدنى لحماية مساحة البامب)",
+            f"🎯 أهداف/وقف وُضعت لـ: `{len(refreshed)}` عملة",
+            f"📌 أساس الحساب من الآن: *`{float(p.base_investment or 0):.2f}$`* (آخر إعادة بناء)",
         ]
         all_errs = cancel_errors[:3] + buy_errors + refresh_errors
         if all_errs:
@@ -2497,6 +2500,10 @@ async def _do_stop(query, tid, pf_id):
 
 
 async def _do_remove_coin(query, tid, pf_id, symbol):
+    """حذف عملة: إلغاء أوامرها ثم بيع الرصيد بسعر السوق ثم شيلها من القاعدة."""
+    import asyncio
+    import time as _time
+
     db = SessionLocal()
     try:
         p = get_portfolio(db, pf_id, tid)
@@ -2512,81 +2519,175 @@ async def _do_remove_coin(query, tid, pf_id, symbol):
             )
             return
 
+        sym = coin.symbol
         await query.edit_message_text(
-            f"⏳ جاري إلغاء أهداف `{coin.symbol}` وبيع الرصيد المتاح بسعر السوق..."
+            f"⏳ جاري حذف `{sym}`:\n"
+            "1) إلغاء أوامر البيع\n"
+            "2) بيع الرصيد بسعر السوق\n"
+            "3) حذفها من المحفظة",
+            parse_mode="Markdown",
         )
-        cancel_result = get_reb().cancel_tp_orders([{
-            "symbol": coin.symbol,
-            "tp_order_id": getattr(coin, "tp_order_id", None),
-            "tp1_order_id": getattr(coin, "tp1_order_id", None),
-            "tp2_order_id": getattr(coin, "tp2_order_id", None),
-            "tp3_order_id": getattr(coin, "tp3_order_id", None),
-        }])
-        if cancel_result.get("errors"):
-            error_text = "\n".join(
-                str(error.get("error") or error)
-                for error in cancel_result["errors"]
-            )
-            await query.edit_message_text(
-                f"❌ تعذر إلغاء كل أهداف `{coin.symbol}`.\n"
-                "لم يتم البيع أو حذف العملة من قاعدة البيانات حفاظًا على المركز.\n\n"
-                f"`{error_text}`",
-                parse_mode="Markdown",
-                reply_markup=pf_keyboard(pf_id, p.is_running),
-            )
-            return
+
+        client = get_mexc()
+        reb = get_reb()
+        loop = asyncio.get_event_loop()
+        notes = []
+        cancelled_count = 0
+
+        # 1) إلغاء أوامر TP المسجّلة + أي أوامر بيع مفتوحة على الزوج
+        def _cancel_all():
+            res = {"cancelled": [], "errors": []}
+            # من القاعدة
+            for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
+                oid = getattr(coin, key, None)
+                if not oid:
+                    continue
+                try:
+                    client.cancel_order(str(oid), sym, strict=False)
+                    res["cancelled"].append(str(oid))
+                except Exception as exc:
+                    # أمر منتهي/ملغي مسبقاً — نكمل
+                    logger.warning("cancel %s %s: %s", sym, oid, exc)
+                    res["errors"].append(str(exc))
+            # من المنصة مباشرة
+            try:
+                extra = client.cancel_all_open_sells(sym)
+                res["cancelled"].extend(extra.get("cancelled") or [])
+                for e in (extra.get("errors") or []):
+                    res["errors"].append(str(e))
+            except Exception as exc:
+                logger.warning("cancel_all_open_sells %s: %s", sym, exc)
+                res["errors"].append(str(exc))
+            return res
+
+        try:
+            cancel_result = await loop.run_in_executor(None, _cancel_all)
+            cancelled_count = len(cancel_result.get("cancelled") or [])
+        except Exception as exc:
+            logger.exception("remove_coin cancel phase")
+            notes.append(ar_error(exc, "إلغاء الأوامر"))
+
+        # انتظر تحرير الرصيد بعد الإلغاء
+        await asyncio.sleep(1.2)
+
+        # 2) بيع الرصيد الحر (وبعد فشل، جرّب الإجمالي لو اتفك)
+        sold_usdt = 0.0
+        sold_amt = 0.0
+        sell_ok = False
+
+        # هل العملة في محفظة شغّالة تانية؟
         other_running = db.query(PortfolioCoin).join(Portfolio).filter(
-            PortfolioCoin.symbol == coin.symbol,
+            PortfolioCoin.symbol == sym,
             PortfolioCoin.portfolio_id != p.id,
             Portfolio.telegram_id == tid,
             Portfolio.status == "active",
             Portfolio.is_running == True,
         ).first()
-        tracked_amount = float(
-            getattr(coin, "remaining_amount", 0)
-            or getattr(coin, "amount", 0)
-            or 0
-        )
-        if other_running and tracked_amount <= 0:
-            # This portfolio has no tracked position to sell. Do not sell the
-            # shared wallet balance that belongs to another running portfolio.
-            stop_result = {"executed": [], "errors": []}
-        else:
-            stop_result = get_reb().stop_portfolio(
-                [coin.symbol],
-                dry_run=False,
-                amount_overrides={coin.symbol: tracked_amount} if other_running else None,
-            )
-        errors = stop_result.get("errors") or []
-        if errors:
-            error_text = "\n".join(str(error) for error in errors)
+
+        tracked = float(coin.remaining_amount or coin.amount or 0)
+
+        def _sell():
+            free = float(client.get_free_amount(sym) or 0)
+            total = float(client.get_total_amount(sym) or 0)
+            # لو في محفظة تانية شغالة: نبيع بس الكمية المتتبعة قدر الإمكان
+            if other_running and tracked > 0:
+                amount = min(tracked * 0.998, free if free > 0 else total)
+            else:
+                amount = free if free > 0 else total
+                amount = amount * 0.998
+            if amount <= 0:
+                return {"sold": 0.0, "amount": 0.0, "dust": True, "error": None}
+            try:
+                px = float(client.get_ticker_price(f"{sym}/{client.quote}") or 0)
+                order = client.create_market_order(
+                    f"{sym}/{client.quote}", "sell", amount
+                )
+                if order is None:
+                    # dust تحت الحد الأدنى
+                    return {"sold": 0.0, "amount": amount, "dust": True, "error": None}
+                usdt = amount * px
+                return {"sold": usdt, "amount": amount, "dust": False, "error": None, "order_id": order.get("id")}
+            except Exception as e:
+                return {"sold": 0.0, "amount": amount, "dust": False, "error": str(e)}
+
+        try:
+            sell_result = await loop.run_in_executor(None, _sell)
+        except Exception as exc:
+            logger.exception("remove_coin sell phase")
             await query.edit_message_text(
-                f"❌ لم يتم حذف `{coin.symbol}` من قاعدة البيانات لأن البيع لم يكتمل.\n"
-                "تمت محاولة إلغاء أهدافها، لكن يجب معالجة خطأ البيع أولًا.\n\n"
-                f"`{error_text}`",
+                f"❌ فشل بيع `{sym}`\n{ar_error(exc, 'بيع السوق')}\n"
+                "لم تُحذف من القاعدة — عالج الخطأ ثم أعد المحاولة.",
                 parse_mode="Markdown",
                 reply_markup=pf_keyboard(pf_id, p.is_running),
             )
             return
 
-        if not remove_coin_from_portfolio(db, pf_id, coin.symbol):
+        if sell_result.get("error"):
+            logger.error("sell %s failed: %s", sym, sell_result["error"])
             await query.edit_message_text(
-                "تعذر حذف سجل العملة من قاعدة البيانات بعد نجاح البيع.",
+                f"❌ فشل بيع `{sym}` بسعر السوق.\n"
+                f"{ar_error(sell_result['error'], 'بيع')}\n"
+                "لم تُحذف من القاعدة.",
+                parse_mode="Markdown",
                 reply_markup=pf_keyboard(pf_id, p.is_running),
             )
             return
-        cancelled = len(cancel_result.get("cancelled", []))
-        sold = sum(float(item.get("usdt") or 0) for item in stop_result.get("executed", []))
+
+        sold_usdt = float(sell_result.get("sold") or 0)
+        sold_amt = float(sell_result.get("amount") or 0)
+        if sell_result.get("dust") and sold_amt <= 0 and tracked <= 0:
+            notes.append("لا يوجد رصيد للبيع (أو غبار تحت الحد الأدنى)")
+        sell_ok = True
+
+        # سجّل حدث البيع إن وُجدت كمية
+        try:
+            entry = float(coin.entry_price or 0)
+            px = sold_usdt / sold_amt if sold_amt > 0 else 0
+            pnl = (px - entry) * sold_amt if entry > 0 and sold_amt > 0 else 0
+            if sold_amt > 0:
+                record_trade_event(
+                    db, tid, p.id, coin.id, sym, "manual_remove",
+                    entry, px, sold_amt, pnl,
+                    details="حذف عملة من المحفظة — بيع سوق",
+                )
+        except Exception:
+            logger.exception("record remove trade")
+
+        # 3) حذف من القاعدة
+        if not remove_coin_from_portfolio(db, pf_id, sym):
+            await query.edit_message_text(
+                f"⚠️ تم التعامل مع `{sym}` على المنصة لكن فشل حذف السجل من القاعدة.",
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
+
+        log_action(db, tid, "remove_coin", f"Removed {sym} sold≈{sold_usdt:.2f}", True, pf_id)
+        msg = (
+            f"✅ تم حذف *{sym}* من محفظة *{p.name}*\n"
+            f"أوامر ملغاة: `{cancelled_count}`\n"
+            f"بيع سوق ≈ `{sold_usdt:.2f}` USDT"
+        )
+        if notes:
+            msg += "\n\n⚠️ " + " | ".join(notes)
         await query.edit_message_text(
-            f"✅ تم حذف `{coin.symbol}` من المحفظة.\n"
-            f"أوامر الأهداف الملغاة: `{cancelled}`\n"
-            f"البيع بسعر السوق: `{sold:.2f}` USDT\n"
-            "تم حذف وقف الخسارة السحابي مع بيانات العملة.",
+            msg,
             parse_mode="Markdown",
             reply_markup=pf_keyboard(pf_id, p.is_running),
         )
+    except Exception as exc:
+        logger.exception("remove_coin fatal")
+        try:
+            await query.edit_message_text(
+                f"❌ {ar_error(exc, 'حذف العملة')}",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception:
+            pass
     finally:
         db.close()
+
 
 
 async def _do_close(query, tid, pf_id):
