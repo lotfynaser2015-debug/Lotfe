@@ -271,23 +271,65 @@ class Rebalancer:
                     ("tp3_order_id", amount * max(0.0, 100.0 - sell1 - sell2) / 100.0, tp3_price),
                 )
                 placed_ids = []
+                skip_notes = []
                 try:
                     for key, qty, target in quantities:
                         if qty <= 0 or target <= 0:
                             continue
+                        # قيمة الأمر أقل من ~1$ → تخطي بدون فشل كامل
+                        if qty * target < 1.0:
+                            skip_notes.append(f"{key}: قيمة صغيرة تم تخطيها")
+                            continue
                         order = self.client.create_limit_sell(symbol, qty, target)
                         if not order or not order.get("id"):
-                            raise RuntimeError(f"{key} was not accepted by MEXC")
+                            # MEXC رفضت أو أقل من الحد الأدنى — لا نلغي باقي الأوامر
+                            skip_notes.append(
+                                f"{key}: المنصة لم تقبل الأمر (حد أدنى/دقة/كمية)"
+                            )
+                            logger.warning(
+                                "manual TP skipped %s %s qty=%s price=%s",
+                                symbol, key, qty, target,
+                            )
+                            continue
                         order_ids[key] = order.get("id")
                         placed_ids.append(order.get("id"))
                 except Exception as exc:
+                    logger.exception("manual TP orders error %s", symbol)
                     for oid in placed_ids:
                         try:
                             self.client.cancel_order(oid, f"{symbol}/{self.quote}")
                         except Exception:
                             pass
-                    results.append({"symbol": symbol, "error": f"manual TP orders failed: {exc}"})
+                    # حتى مع الفشل نُرجع استوب يدوي عشان المراقبة تشتغل
+                    results.append({
+                        "symbol": symbol,
+                        "amount": amount,
+                        "entry_price": entry,
+                        "tp1_price": tp1_price,
+                        "tp2_price": tp2_price,
+                        "tp3_price": tp3_price,
+                        "stop_loss_price": sl,
+                        "sl_price": sl,
+                        "original_sl_price": sl,
+                        "tp1_order_id": None,
+                        "tp2_order_id": None,
+                        "tp3_order_id": None,
+                        "tp_order_id": None,
+                        "mode": "manual",
+                        "trail_pct": DEFAULT_TRAIL_PCT,
+                        "sl_pct": sl_pct_use,
+                        "error": f"فشل وضع أهداف يدوية: {exc}",
+                        "warning": str(exc),
+                    })
                     continue
+                if skip_notes and not placed_ids:
+                    # مفيش ولا أمر اتحط — نكمل بالاستوب فقط
+                    logger.warning("manual %s: no TP placed (%s)", symbol, "; ".join(skip_notes))
+            warn = None
+            if not smart_mode:
+                notes = locals().get("skip_notes") or []
+                if notes:
+                    warn = "؛ ".join(notes)
             results.append({
                 "symbol": symbol,
                 "amount": amount,
@@ -308,6 +350,7 @@ class Rebalancer:
                 "tp1_sell_pct": float(tp1_sell_pct or 0),
                 "tp2_sell_pct": float(tp2_sell_pct or 0),
                 "error": None,
+                "warning": warn,
             })
         return results
 

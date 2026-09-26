@@ -67,6 +67,32 @@ def get_mexc() -> MexcClient:
     return _mexc
 
 
+def ar_error(exc, context: str = "") -> str:
+    """وصف خطأ بالعربي للبوت + اللوج."""
+    msg = str(exc or "").strip()
+    low = msg.lower()
+    if "not accepted" in low or "tp1" in low or "tp2" in low or "tp3" in low:
+        ar = "المنصة رفضت أمر البيع المحدد (كمية صغيرة أو حدود الزوج)"
+    elif "insufficient" in low or "balance" in low:
+        ar = "الرصيد غير كافٍ لتنفيذ الأمر"
+    elif "min" in low and ("notional" in low or "cost" in low or "amount" in low):
+        ar = "قيمة الأمر أقل من الحد الأدنى للمنصة"
+    elif "precision" in low or "tick" in low:
+        ar = "دقة السعر/الكمية غير متوافقة مع قواعد المنصة"
+    elif "timeout" in low or "network" in low or "connection" in low:
+        ar = "مشكلة اتصال بالمنصة أو انتهاء المهلة"
+    elif "rate limit" in low or "too many" in low:
+        ar = "تم تجاوز حد الطلبات — حاول بعد لحظات"
+    else:
+        ar = "خطأ تقني أثناء التنفيذ"
+    full = f"{ar}"
+    if context:
+        full = f"{context}: {full}"
+    if msg:
+        full = f"{full}\nالتفاصيل: `{msg[:200]}`"
+    return full
+
+
 def get_reb() -> Rebalancer:
     global _reb
     if _reb is None:
@@ -106,24 +132,17 @@ def main_menu_keyboard():
 
 
 def pf_keyboard(pf_id: int, is_running: bool):
+    """أزرار المحفظة الأساسية فقط — بدون تفاصيل/إحصائيات/ناقص/زيادة مبلغ."""
     rows = [
         [
             InlineKeyboardButton("▶️ تشغيل" if not is_running else "⏹ إيقاف", callback_data=f"toggle_{pf_id}"),
-            InlineKeyboardButton("📊 تفاصيل", callback_data=f"view_{pf_id}"),
+            InlineKeyboardButton("🔄 تحديث الأهداف", callback_data=f"refresh_tp_{pf_id}"),
         ],
         [
             InlineKeyboardButton("➕ عملة", callback_data=f"addcoin_{pf_id}"),
             InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
         ],
-        [
-            InlineKeyboardButton("💰 زيادة المبلغ", callback_data=f"increase_{pf_id}"),
-            InlineKeyboardButton("🔄 تحديث الأهداف", callback_data=f"refresh_tp_{pf_id}"),
-        ],
-        [InlineKeyboardButton("🧠/✍️ وضع التحكم", callback_data=f"mode_{pf_id}")],
-        [
-            InlineKeyboardButton("🔎 فحص الناقص", callback_data=f"check_missing_{pf_id}"),
-            InlineKeyboardButton("📊 إحصائيات", callback_data=f"stats_{pf_id}"),
-        ],
+        [InlineKeyboardButton("🧠 ذكي / ✍️ يدوي", callback_data=f"mode_{pf_id}")],
         [
             InlineKeyboardButton("♻️ إعادة بناء", callback_data=f"rebuild_{pf_id}"),
             InlineKeyboardButton("🗑 حذف", callback_data=f"delete_pf_{pf_id}"),
@@ -1041,12 +1060,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ——— اختيار وضع التحكم داخل المحفظة ———
     if data.startswith("mode_cancel_"):
         pf_id = int(data.split("_")[-1])
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, pf_id, tid)
+            running = p.is_running if p else False
+        finally:
+            db.close()
         await query.edit_message_text(
             "تم إلغاء تغيير الوضع.",
-            reply_markup=pf_keyboard(pf_id, False),
+            reply_markup=pf_keyboard(pf_id, running),
         )
         return
+
     if data.startswith("mode_"):
+        """تبديل ذكي ↔ يدوي بدون أي بيع — تحديث الوضع + الأوامر فقط."""
         import asyncio
         confirming_manual = data.startswith("mode_confirm_")
         pf_id = int(data.split("_")[-1])
@@ -1057,25 +1084,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
                 return
             current = str(getattr(p, "control_mode", "smart") or "smart").lower()
+
+            # —— طلب تأكيد قبل تفعيل اليدوي ——
             if current != "manual" and not confirming_manual:
                 user = get_or_create_user(db, tid)
                 await query.edit_message_text(
-                    "⚠️ *تأكيد تفعيل الوضع اليدوي*\n\n"
-                    "بعد التأكيد سيتم وضع أوامر بيع Limit فعلية على MEXC باستخدام الإعدادات العامة:\n"
-                    f"TP1: `{float(user.tp1_pct or 3):g}%` — بيع `{float(user.tp1_sell_pct or 40):g}%`\n"
-                    f"TP2: `{float(user.tp2_pct or 5):g}%` — بيع `{float(user.tp2_sell_pct or 30):g}%`\n"
-                    f"TP3: `{float(user.tp3_pct or 8):g}%` — بيع الباقي\n"
+                    "⚠️ *تفعيل الوضع اليدوي*\n\n"
+                    "سيتم وضع أوامر بيع Limit على MEXC (TP1/TP2/TP3) "
+                    "حسب الإعدادات العامة، مع *وقف خسارة ثابت* يراقبه البوت.\n\n"
+                    f"TP1: `{float(user.tp1_pct or 3):g}%` بيع `{float(user.tp1_sell_pct or 40):g}%`\n"
+                    f"TP2: `{float(user.tp2_pct or 5):g}%` بيع `{float(user.tp2_sell_pct or 30):g}%`\n"
+                    f"TP3: `{float(user.tp3_pct or 8):g}%` باقي الكمية\n"
                     f"وقف الخسارة: `{float(user.stop_loss_pct or 3):g}%`\n\n"
-                    "لن يتم بيع فوري أو إيقاف المحفظة. هل تريد المتابعة؟",
+                    "⚠️ *لن يتم بيع فوري ولا إيقاف المحفظة* — تحديث الوضع فقط.",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✅ تأكيد ووضع الأهداف", callback_data=f"mode_confirm_{pf_id}")],
+                        [InlineKeyboardButton("✅ تأكيد اليدوي", callback_data=f"mode_confirm_{pf_id}")],
                         [InlineKeyboardButton("❌ إلغاء", callback_data=f"mode_cancel_{pf_id}")],
                     ]),
                 )
                 return
 
-            # The confirmed manual path uses the user's general TP/SL values.
+            notes = []
+            applied = 0
+
+            # —— إلى يدوي ——
             if current != "manual" and confirming_manual:
                 user = get_or_create_user(db, tid)
                 tp1 = float(user.tp1_pct or 3.0)
@@ -1104,80 +1137,140 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     }
                     for c in open_coins
                 ]
+                results = []
                 if coins_data:
-                    results = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: get_reb().place_tp_orders(
-                            coins_data, tp1, tp2, tp3, sl_pct, s1, s2,
-                            control_mode="manual",
-                        ),
-                    )
-                    failures = [r for r in results if r.get("error")]
-                    if failures or len(results) != len(coins_data):
-                        # Best-effort rollback: no mode change if all targets
-                        # could not be placed.
-                        for r in results:
-                            for key in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
-                                if r.get(key):
-                                    try:
-                                        get_mexc().cancel_order(r[key], f"{r['symbol']}/USDT")
-                                    except Exception:
-                                        pass
-                        error_text = "\n".join(f"{r.get('symbol')}: {r.get('error')}" for r in failures)
-                        await query.edit_message_text(
-                            "❌ لم يتم تفعيل الوضع اليدوي؛ لم تتغير المحفظة.\n" + error_text,
-                            reply_markup=pf_keyboard(pf_id, p.is_running),
+                    try:
+                        results = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: get_reb().place_tp_orders(
+                                coins_data, tp1, tp2, tp3, sl_pct, s1, s2,
+                                control_mode="manual",
+                            ),
                         )
-                        return
-                    for coin, result in zip(open_coins, results):
+                    except Exception as exc:
+                        logger.exception("mode switch to manual failed")
+                        notes.append(ar_error(exc, "تفعيل اليدوي"))
+
+                by_sym = {r.get("symbol"): r for r in (results or []) if r.get("symbol")}
+                for coin in open_coins:
+                    r = by_sym.get(coin.symbol) or {}
+                    if r.get("error") and not r.get("sl_price"):
+                        notes.append(f"`{coin.symbol}`: {r.get('error')}")
+                        # حتى مع الخطأ نضبط استوب من الإعدادات
+                        entry = float(coin.entry_price or 0)
+                        sl = entry * (1 - sl_pct / 100.0) if entry > 0 else 0
                         update_coin_position(
                             db, coin.id,
-                            tp1_price=result.get("tp1_price", 0),
-                            tp2_price=result.get("tp2_price", 0),
-                            tp3_price=result.get("tp3_price", 0),
-                            current_sl_price=max(float(coin.current_sl_price or 0), float(result.get("sl_price") or 0)),
-                            tp1_order_id=result.get("tp1_order_id"),
-                            tp2_order_id=result.get("tp2_order_id"),
-                            tp3_order_id=result.get("tp3_order_id"),
+                            current_sl_price=max(float(coin.current_sl_price or 0), sl),
+                            original_sl_price=sl or coin.original_sl_price,
+                            tp1_order_id=None, tp2_order_id=None, tp3_order_id=None,
                         )
+                        continue
+                    if r.get("warning"):
+                        notes.append(f"`{coin.symbol}`: {r.get('warning')}")
+                    update_coin_position(
+                        db, coin.id,
+                        tp1_price=r.get("tp1_price", 0),
+                        tp2_price=r.get("tp2_price", 0),
+                        tp3_price=r.get("tp3_price", 0),
+                        current_sl_price=max(
+                            float(coin.current_sl_price or 0),
+                            float(r.get("sl_price") or 0),
+                        ),
+                        original_sl_price=r.get("original_sl_price") or r.get("sl_price"),
+                        tp1_order_id=r.get("tp1_order_id"),
+                        tp2_order_id=r.get("tp2_order_id"),
+                        tp3_order_id=r.get("tp3_order_id"),
+                    )
+                    applied += 1
                 p.tp1_pct, p.tp2_pct, p.tp3_pct = tp1, tp2, tp3
                 p.tp1_sell_pct, p.tp2_sell_pct, p.stop_loss_pct = s1, s2, sl_pct
-            if current == "manual":
-                cancel_result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: get_reb().cancel_tp_orders([
-                        {
-                            "symbol": c.symbol,
-                            "tp1_order_id": getattr(c, "tp1_order_id", None),
-                            "tp2_order_id": getattr(c, "tp2_order_id", None),
-                            "tp3_order_id": getattr(c, "tp3_order_id", None),
-                        }
-                        for c in p.coins
-                    ]),
+                p.control_mode = "manual"
+                db.commit()
+                msg = (
+                    f"✅ *الوضع: يدوي (أهداف ثابتة + وقف ثابت)*\n\n"
+                    f"تم التحديث على `{applied}` مركز.\n"
+                    f"*لم يتم بيع أي عملة.*\n"
+                    f"الاستوب يُراقب من البوت ويُنفَّذ بسعر السوق عند الضرب."
                 )
-                if cancel_result.get("errors"):
-                    await query.edit_message_text(
-                        "❌ لم يتم التحويل للوضع الذكي؛ تعذر إلغاء بعض أوامر TP اليدوية.\n"
-                        "لم يتم بيع أي عملة.",
-                        reply_markup=pf_keyboard(pf_id, p.is_running),
+                if notes:
+                    msg += "\n\n⚠️ ملاحظات:\n" + "\n".join(f"• {n}" for n in notes[:15])
+                    logger.warning("manual mode notes pf=%s: %s", pf_id, notes)
+                await query.edit_message_text(
+                    msg, parse_mode="Markdown",
+                    reply_markup=pf_keyboard(pf_id, p.is_running),
+                )
+                return
+
+            # —— إلى ذكي ——
+            if current == "manual":
+                try:
+                    cancel_result = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: get_reb().cancel_tp_orders([
+                            {
+                                "symbol": c.symbol,
+                                "tp1_order_id": getattr(c, "tp1_order_id", None),
+                                "tp2_order_id": getattr(c, "tp2_order_id", None),
+                                "tp3_order_id": getattr(c, "tp3_order_id", None),
+                            }
+                            for c in p.coins
+                        ]),
                     )
-                    return
+                    if cancel_result.get("errors"):
+                        for e in cancel_result["errors"][:10]:
+                            notes.append(str(e))
+                            logger.warning("cancel TP on smart switch: %s", e)
+                except Exception as exc:
+                    logger.exception("cancel TP on smart switch")
+                    notes.append(ar_error(exc, "إلغاء أوامر اليدوي"))
+
                 for coin in p.coins:
+                    entry = float(coin.entry_price or 0)
+                    # أبقِ أفضل استوب (لا تخفضه) — مناسب للـ trailing
+                    cur = float(coin.current_sl_price or 0)
                     update_coin_position(
                         db, coin.id,
                         tp1_order_id=None, tp2_order_id=None, tp3_order_id=None,
+                        tp1_price=0.0, tp2_price=0.0, tp3_price=0.0,
+                        current_sl_price=cur,
+                        position_status="open" if (coin.position_status or "") in (
+                            "open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"
+                        ) else coin.position_status,
                     )
-            p.control_mode = "manual" if current != "manual" else "smart"
-            applied = sum(1 for c in p.coins if (c.position_status or "") in ("open", "tp1_hit", "tp2_hit", "tp3_hit")) if p.control_mode == "manual" else 0
-            db.commit()
-            mode_name = "يدوي (TP/SL ثابت)" if p.control_mode == "manual" else "ذكي (ATR + Trailing)"
+                    if (coin.position_status or "") in ("open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"):
+                        applied += 1
+                p.control_mode = "smart"
+                db.commit()
+                msg = (
+                    f"✅ *الوضع: ذكي (وقف متحرك)*\n\n"
+                    f"تم إلغاء أوامر TP اليدوية من المنصة.\n"
+                    f"مراكز تحت المتابعة: `{applied}`\n"
+                    f"*لم يتم بيع أي عملة.*\n"
+                    f"الاستوب هيتحرك مع السعر تلقائيًا."
+                )
+                if notes:
+                    msg += "\n\n⚠️ ملاحظات:\n" + "\n".join(f"• {n}" for n in notes[:15])
+                await query.edit_message_text(
+                    msg, parse_mode="Markdown",
+                    reply_markup=pf_keyboard(pf_id, p.is_running),
+                )
+                return
+
             await query.edit_message_text(
-                f"✅ تم اختيار وضع: *{mode_name}*\n\n"
-                f"تم تطبيق الوضع على `{applied}` مركز مفتوح.\n"
-                "لم يتم إيقاف المحفظة أو بيع أي عملة.",
-                parse_mode="Markdown",
+                "الوضع الحالي لم يتغير.",
                 reply_markup=pf_keyboard(pf_id, p.is_running),
             )
+        except Exception as exc:
+            logger.exception("mode switch error")
+            try:
+                await query.edit_message_text(
+                    f"❌ {ar_error(exc, 'تغيير الوضع')}\nلم يتم بيع أي عملة.",
+                    parse_mode="Markdown",
+                    reply_markup=main_menu_keyboard(),
+                )
+            except Exception:
+                pass
         finally:
             db.close()
         return
@@ -1444,7 +1537,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     ),
                 )
                 if result.get("error"):
-                    buy_errors.append(f"{coin.symbol}: {result['error']}")
+                    buy_errors.append(f"{coin.symbol}: {result.get('warning') or result.get('error')}")
                     continue
                 entry = float(result.get("entry_price") or 0)
                 amount = float(result.get("amount") or result.get("remaining_amount") or 0)
@@ -1532,7 +1625,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     control_mode=getattr(p, "control_mode", "smart"),
                 )[0]
                 if result.get("error"):
-                    refresh_errors.append(f"{coin.symbol}: {result['error']}")
+                    refresh_errors.append(f"{coin.symbol}: {result.get('warning') or result.get('error')}")
                 update_coin_position(
                     db, coin.id,
                     entry_price=entry,
@@ -1688,7 +1781,7 @@ async def _do_refresh_tpsl(query, tid, pf_id):
                     control_mode="smart",
                 )[0]
                 if result.get("error"):
-                    errors.append(f"{coin.symbol}: {result['error']}")
+                    errors.append(f"{coin.symbol}: {result.get('warning') or result.get('error')}")
                     continue
 
                 new_sl = float(result.get("sl_price") or result.get("stop_loss_price") or 0)
