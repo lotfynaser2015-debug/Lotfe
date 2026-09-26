@@ -398,11 +398,20 @@ class Rebalancer:
             if filled <= 0:
                 filled = min(remaining, original * fallback_pct / 100.0)
             price = float((order or {}).get("average") or (order or {}).get("price") or fallback_price or 0)
+            entry = float(coin.entry_price or 0)
+            tp1_px = float(coin.tp1_price or 0)
+            if stage == "tp1":
+                new_sl = entry
+            elif stage == "tp2":
+                new_sl = max(float(coin.current_sl_price or 0), tp1_px if tp1_px > 0 else entry)
+            else:
+                new_sl = float(coin.current_sl_price or 0)
             actions.append({
                 "coin_id": getattr(coin, "id", None), "symbol": coin.symbol,
                 "action": f"{stage}_hit", "price": price, "fill_price": price,
                 "filled_amount": min(remaining, filled),
-                "new_sl": float(coin.current_sl_price or 0),
+                "new_sl": new_sl,
+                "enable_trail": stage == "tp2",
                 "exchange_order": True,
             })
         return actions
@@ -454,23 +463,34 @@ class Rebalancer:
             remaining = float(coin.remaining_amount or coin.amount or 0)
             sl = float(coin.current_sl_price or 0)
 
-            # ----- رصيد فعلي -----
+            # ----- رصيد فعلي (الإجمالي وليس الحر فقط) -----
+            # في الوضع اليدوي الرصيد غالبًا مقفول في أوامر Limit → free=0 بالغلط
             try:
                 free_amt = float(self.client.get_free_amount(symbol) or 0)
             except Exception:
-                free_amt = remaining
+                free_amt = 0.0
+            try:
+                total_amt = float(self.client.get_total_amount(symbol) or 0)
+            except Exception:
+                total_amt = free_amt or remaining
 
-            market_val = free_amt * price
+            # استخدم الأكبر بين المتاح والإجمالي لتجنب إغلاق وهمي
+            effective_amt = max(free_amt, total_amt, 0.0)
+            market_val = effective_amt * price
             if status != "waiting_reentry":
-                if free_amt <= 0 or market_val < MIN_POSITION_USDT:
+                # إغلاق فقط لو مفيش رصيد حقيقي على المنصة
+                if effective_amt <= 0 or market_val < MIN_POSITION_USDT:
+                    # لو القاعدة أصلًا فاضية → صامت (تزامن بدون إشعار)
+                    silent = remaining <= 0
                     actions.append({
                         "coin_id": getattr(coin, "id", None),
                         "symbol": symbol,
                         "action": "tp_full_close",
                         "stage": "balance_zero",
                         "price": price,
-                        "filled_amount": remaining or free_amt,
+                        "filled_amount": remaining if remaining > 0 else 0,
                         "fill_price": price,
+                        "silent": silent,
                     })
                     continue
 
@@ -558,62 +578,94 @@ class Rebalancer:
                 })
                 continue
 
-            # ----- الوضع اليدوي: أهداف ثابتة + وقف ثابت -----
-            # لا نخلط هذا المسار مع التريلينج الذكي حتى لا تتغير أهداف المستخدم.
+            # ----- الوضع اليدوي: أهداف + رفع استوب متدرج ثم trailing بعد TP2 -----
             if control_mode == "manual":
-                # Once exchange limit orders exist, the exchange is the sole
-                # TP executor; the sync method above records fills.
-                if any(getattr(coin, key, None) for key in ("tp1_order_id", "tp2_order_id", "tp3_order_id")):
-                    continue
-                base_amount = float(coin.amount or remaining or 0)
+                # أوامر Limit على المنصة → المزامنة تسجّل الامتلاء؛ هنا للطوارئ بدون أوامر
+                has_exchange_tp = any(
+                    getattr(coin, key, None)
+                    for key in ("tp1_order_id", "tp2_order_id", "tp3_order_id")
+                )
                 portfolio = getattr(coin, "portfolio", None)
+                base_amount = float(coin.amount or remaining or 0)
                 tp1_sell_pct = float(getattr(portfolio, "tp1_sell_pct", None) or 40.0)
                 tp2_sell_pct = float(getattr(portfolio, "tp2_sell_pct", None) or 30.0)
-                if status == "open" and float(coin.tp1_price or 0) > 0 and price >= float(coin.tp1_price):
-                    filled = min(remaining, base_amount * max(0.0, tp1_sell_pct) / 100.0)
-                    if filled <= 0:
-                        filled = min(remaining, base_amount * 0.40)
-                    actions.append({
-                        "coin_id": getattr(coin, "id", None), "symbol": symbol,
-                        "action": "tp1_hit", "price": price, "fill_price": price,
-                        "filled_amount": filled,
-                    })
-                elif status in ("open", "tp1_hit") and float(coin.tp2_price or 0) > 0 and price >= float(coin.tp2_price):
-                    filled = min(remaining, base_amount * max(0.0, tp2_sell_pct) / 100.0)
-                    if filled <= 0:
-                        filled = min(remaining, base_amount * 0.30)
-                    actions.append({
-                        "coin_id": getattr(coin, "id", None), "symbol": symbol,
-                        "action": "tp2_hit", "price": price, "fill_price": price,
-                        "filled_amount": filled, "new_sl": max(sl, entry),
-                    })
-                elif status in ("open", "tp1_hit", "tp2_hit") and float(coin.tp3_price or 0) > 0 and price >= float(coin.tp3_price):
-                    actions.append({
-                        "coin_id": getattr(coin, "id", None), "symbol": symbol,
-                        "action": "tp3_hit", "price": price, "fill_price": price,
-                        "filled_amount": remaining,
-                    })
-                # Manual mode never falls through to the adaptive trailing logic.
-                continue
+                tp1_px = float(coin.tp1_price or 0)
+                tp2_px = float(coin.tp2_price or 0)
+                tp3_px = float(coin.tp3_price or 0)
+
+                if not has_exchange_tp:
+                    if status == "open" and tp1_px > 0 and price >= tp1_px:
+                        filled = min(remaining, base_amount * max(0.0, tp1_sell_pct) / 100.0)
+                        if filled <= 0:
+                            filled = min(remaining, base_amount * 0.40)
+                        actions.append({
+                            "coin_id": getattr(coin, "id", None), "symbol": symbol,
+                            "action": "tp1_hit", "price": price, "fill_price": price,
+                            "filled_amount": filled,
+                            "new_sl": entry,  # الهدف 1 → الاستوب = الدخول
+                        })
+                        continue
+                    if status in ("open", "tp1_hit") and tp2_px > 0 and price >= tp2_px:
+                        filled = min(remaining, base_amount * max(0.0, tp2_sell_pct) / 100.0)
+                        if filled <= 0:
+                            filled = min(remaining, base_amount * 0.30)
+                        actions.append({
+                            "coin_id": getattr(coin, "id", None), "symbol": symbol,
+                            "action": "tp2_hit", "price": price, "fill_price": price,
+                            "filled_amount": filled,
+                            "new_sl": max(sl, tp1_px if tp1_px > 0 else entry),  # الهدف 2 → استوب عند TP1
+                            "enable_trail": True,  # بعد TP2 → وضع بامب/trailing
+                        })
+                        continue
+                    if status in ("open", "tp1_hit") and tp3_px > 0 and price >= tp3_px and tp2_px <= 0:
+                        # لو مفيش TP2: الهدف الأخير يبيع الباقي
+                        actions.append({
+                            "coin_id": getattr(coin, "id", None), "symbol": symbol,
+                            "action": "tp3_hit", "price": price, "fill_price": price,
+                            "filled_amount": remaining,
+                        })
+                        continue
+
+                # بعد TP2 (أو tp3_hit جزئي): trailing لمتابعة البامب
+                if status in ("tp2_hit", "tp3_hit"):
+                    pass  # fall through to trailing below
+                else:
+                    continue
+
 
             # ----- Trailing: ارفع الاستوب مع السعر -----
             if entry <= 0:
                 continue
 
             gain_pct = ((price / entry) - 1.0) * 100.0
+            portfolio = getattr(coin, "portfolio", None)
 
-            # اختيار مسافة الـ trail حسب قوة الحركة
+            # نسب من إعدادات المحفظة/المستخدم إن وُجدت
+            def _cfg(name, default):
+                v = getattr(portfolio, name, None) if portfolio is not None else None
+                try:
+                    if v is not None and float(v) > 0:
+                        return float(v)
+                except Exception:
+                    pass
+                return float(default)
+
+            base_trail = _cfg("trail_pct", DEFAULT_TRAIL_PCT)
+            be_lock = _cfg("be_lock_pct", BE_LOCK_PCT)
+
+            # اختيار مسافة الـ trail حسب قوة الحركة (على أساس trail الأساسي)
             if gain_pct >= PUMP_STRONG_GAIN_PCT:
-                trail_pct = PUMP_STRONG_TRAIL_PCT
+                trail_pct = max(base_trail, PUMP_STRONG_TRAIL_PCT)
                 mode = "pump_strong"
-            elif gain_pct >= PUMP_GAIN_PCT:
-                trail_pct = PUMP_TRAIL_PCT
-                mode = "pump"
+            elif gain_pct >= PUMP_GAIN_PCT or (
+                control_mode == "manual" and status in ("tp2_hit", "tp3_hit")
+            ):
+                trail_pct = max(base_trail, PUMP_TRAIL_PCT) if gain_pct >= PUMP_GAIN_PCT else base_trail
+                mode = "pump" if gain_pct >= PUMP_GAIN_PCT else "trail"
             else:
-                trail_pct = DEFAULT_TRAIL_PCT
+                trail_pct = base_trail
                 mode = "trail"
 
-            # استوب مقترح من السعر الحالي
             candidate = trailing_stop_price(
                 current_price=price,
                 current_sl=sl if sl > 0 else 0.0,
@@ -622,9 +674,14 @@ class Rebalancer:
                 min_trail_pct=trail_pct,
             )
 
-            # قفل break-even بعد ربح BE_LOCK_PCT
-            if gain_pct >= BE_LOCK_PCT:
+            # قفل break-even بعد ربح be_lock
+            if gain_pct >= be_lock:
                 candidate = max(candidate, entry)
+            # في اليدوي بعد TP2: الاستوب لا يقل عن TP1
+            if control_mode == "manual" and status in ("tp2_hit", "tp3_hit"):
+                tp1_px = float(coin.tp1_price or 0)
+                if tp1_px > 0:
+                    candidate = max(candidate, tp1_px)
 
             # الاستوب الابتدائي لو لسه مش متعيّن
             if sl <= 0:

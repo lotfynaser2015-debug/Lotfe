@@ -612,6 +612,13 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user = get_or_create_user(db, update.effective_user.id)
                     if hasattr(user, user_field):
                         setattr(user, user_field, val)
+                        # انسخ إعدادات التريل لكل محافظ المستخدم
+                        if user_field in ("trail_pct", "be_lock_pct", "stop_loss_pct"):
+                            for pf in db.query(Portfolio).filter(
+                                Portfolio.telegram_id == update.effective_user.id,
+                                Portfolio.status == "active",
+                            ).all():
+                                setattr(pf, user_field, val)
                         db.commit()
                         await update.message.reply_text(
                             f"✅ تم تحديث `{user_field}` = `{val}`",
@@ -792,14 +799,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db = SessionLocal()
         try:
             user = get_or_create_user(db, tid)
+            trail = float(getattr(user, "trail_pct", None) or 2.0)
+            be = float(getattr(user, "be_lock_pct", None) or 4.0)
             msg = (
                 "⚙️ *الإعدادات العامة*\n\n"
+                "*يدوي — أهداف:*\n"
                 f"TP1: `{user.tp1_pct or 3}%` | بيع: `{user.tp1_sell_pct or 40}%`\n"
                 f"TP2: `{user.tp2_pct or 5}%` | بيع: `{user.tp2_sell_pct or 30}%`\n"
                 f"TP3: `{user.tp3_pct or 8}%`\n"
-                f"وقف الخسارة: `{user.stop_loss_pct or 3}%`\n"
-                f"أقصى عملات/محفظة: `{user.max_coins_per_portfolio or 30}`\n\n"
-                "_لتعديل أهداف محفظة معيّنة: افتح المحفظة → الأهداف_"
+                f"وقف ابتدائي: `{user.stop_loss_pct or 3}%`\n\n"
+                "*ذكي — وقف متحرك:*\n"
+                f"مسافة التريل: `{trail}%` (تحت السعر)\n"
+                f"قفل رأس المال بعد ربح: `{be}%`\n\n"
+                f"أقصى عملات/محفظة: `{user.max_coins_per_portfolio or 30}`"
             )
             await query.edit_message_text(
                 msg,
@@ -811,6 +823,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      InlineKeyboardButton("بيع 2 %", callback_data="set_tp2_sell_pct")],
                     [InlineKeyboardButton("TP3 %", callback_data="set_tp3_pct"),
                      InlineKeyboardButton("استوب %", callback_data="set_stop_loss_pct")],
+                    [InlineKeyboardButton("مسافة تريل %", callback_data="set_trail_pct"),
+                     InlineKeyboardButton("قفل ربح %", callback_data="set_be_lock_pct")],
                     [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
                 ]),
             )
@@ -821,6 +835,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("set_") and data in (
         "set_tp1_pct", "set_tp2_pct", "set_tp3_pct",
         "set_tp1_sell_pct", "set_tp2_sell_pct", "set_stop_loss_pct",
+        "set_trail_pct", "set_be_lock_pct",
     ):
         field = data[len("set_"):]
         context.user_data["waiting"] = True
@@ -831,7 +846,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "tp3_pct": "هدف 3 %",
             "tp1_sell_pct": "نسبة البيع عند الهدف 1",
             "tp2_sell_pct": "نسبة البيع عند الهدف 2",
-            "stop_loss_pct": "وقف الخسارة %",
+            "stop_loss_pct": "وقف الخسارة الابتدائي %",
+            "trail_pct": "مسافة التريل تحت السعر % (ذكي)",
+            "be_lock_pct": "قفل رأس المال بعد ربح % (ذكي)",
         }
         await query.edit_message_text(
             f"أرسل قيمة *{labels.get(field, field)}*:\n(رقم بين 0 و 100)",
@@ -2582,8 +2599,7 @@ async def _do_stop(query, tid, pf_id):
         if not fail_symbols:
             reset_coin_positions(db, pf_id)
         else:
-            # Keep failed-to-sell rows tracked so a retry/rebuild can recover
-            # them instead of silently losing unsold balances from the DB.
+            # Keep failed-to-sell rows tracked so a retry can recover them.
             failed_set = {str(item).split(":", 1)[0].strip() for item in fail_symbols}
             for c in coins:
                 if c.symbol not in failed_set:
@@ -3401,20 +3417,21 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             if act["action"] == "tp_full_close":
+                # مزامنة: رصيد المنصة صفر — بدون إشعار مزعج (البيع الحقيقي له إشعار SL/إيقاف)
                 remaining_before = float(coin.remaining_amount or coin.amount or 0)
-                filled_amount = float(act.get("filled_amount") or remaining_before)
-                filled_amount = min(filled_amount, remaining_before) if remaining_before > 0 else filled_amount
                 fill_price = float(act.get("fill_price") or act.get("price") or 0)
                 stage = act.get("stage") or "tp"
-                pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount if fill_price and coin.entry_price else 0
-                record_trade_event(
-                    db, tid, pf.id, coin.id, symbol, stage if stage != "balance_zero" else "tp_full",
-                    coin.entry_price, fill_price, filled_amount, pnl,
-                    details=f"Full close ({stage})",
-                )
+                filled_amount = float(act.get("filled_amount") or remaining_before or 0)
+                if remaining_before > 0 and fill_price and float(coin.entry_price or 0) > 0:
+                    pnl = (fill_price - float(coin.entry_price)) * min(filled_amount, remaining_before)
+                    record_trade_event(
+                        db, tid, pf.id, coin.id, symbol, "balance_sync",
+                        coin.entry_price, fill_price, min(filled_amount, remaining_before), pnl,
+                        details=f"مزامنة رصيد صفر ({stage})",
+                    )
                 update_coin_position(
                     db, coin.id,
-                    position_status="closed",
+                    position_status="idle",
                     current_sl_price=0.0,
                     remaining_amount=0.0,
                     amount=0.0,
@@ -3423,16 +3440,10 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     tp3_order_id=None,
                     tp_order_id=None,
                 )
-                msg = (
-                    f"✅ *إغلاق كامل* — `{symbol}`\n"
-                    f"السعر: `{act['price']:.6g}`\n"
-                    f"تم بيع الكمية كلها (هدف واحد / رصيد صفر)\n"
-                    f"المحفظة: *{pf.name if pf else '—'}*"
+                logger.info(
+                    "balance_zero sync silent %s pf=%s remaining_was=%.6g",
+                    symbol, getattr(pf, "id", None), remaining_before,
                 )
-                try:
-                    await context.bot.send_message(tid, msg, parse_mode="Markdown")
-                except Exception:
-                    pass
 
             elif act["action"] == "tp1_hit":
                 remaining_before = float(coin.remaining_amount or coin.amount or 0)
@@ -3476,10 +3487,10 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                         db, coin.id,
                         position_status="tp1_hit",
                         current_sl_price=(
-                            coin.current_sl_price
+                            float(act.get("new_sl") or coin.entry_price or 0)
                             if str(getattr(getattr(coin, "portfolio", None), "control_mode", "smart") or "smart").lower() == "manual"
                             else coin.entry_price
-                        ),
+                        ) or coin.entry_price,
                         remaining_amount=new_rem,
                         tp1_order_id=None,
                     )

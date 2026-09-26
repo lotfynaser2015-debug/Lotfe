@@ -28,6 +28,9 @@ class UserSettings(Base):
     tp2_sell_pct = Column(Float, default=30.0)  # نسبة البيع عند الهدف 2
     # الباقي يُباع عند الهدف 3 أو يبقى مع الاستوب المرفوع
     stop_loss_pct = Column(Float, default=3.0)
+    # إعدادات الوضع الذكي (وقف متحرك)
+    trail_pct = Column(Float, default=2.0)      # مسافة الاستوب تحت السعر %
+    be_lock_pct = Column(Float, default=4.0)    # بعد ربح X% → قفل عند الدخول
     # legacy single field kept for migration compatibility
     take_profit_pct = Column(Float, default=5.0)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -59,6 +62,8 @@ class Portfolio(Base):
     tp1_sell_pct = Column(Float, nullable=True)
     tp2_sell_pct = Column(Float, nullable=True)
     stop_loss_pct = Column(Float, nullable=True)
+    trail_pct = Column(Float, nullable=True)
+    be_lock_pct = Column(Float, nullable=True)
 
     last_rebalance = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -161,7 +166,7 @@ def init_db():
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN base_investment DOUBLE PRECISION DEFAULT 0"))
             if "control_mode" not in cols:
                 conn.execute(text("ALTER TABLE portfolios ADD COLUMN control_mode VARCHAR(10) DEFAULT 'smart'"))
-            for col in ("tp1_pct", "tp2_pct", "tp3_pct", "tp1_sell_pct", "tp2_sell_pct", "stop_loss_pct"):
+            for col in ("tp1_pct", "tp2_pct", "tp3_pct", "tp1_sell_pct", "tp2_sell_pct", "stop_loss_pct", "trail_pct", "be_lock_pct"):
                 if col not in cols:
                     conn.execute(text(f"ALTER TABLE portfolios ADD COLUMN {col} DOUBLE PRECISION"))
 
@@ -199,6 +204,8 @@ def init_db():
                 ("tp1_pct", "3.0"),
                 ("tp2_pct", "5.0"),
                 ("tp3_pct", "8.0"),
+                ("trail_pct", "2.0"),
+                ("be_lock_pct", "4.0"),
                 ("tp1_sell_pct", "40.0"),
                 ("tp2_sell_pct", "30.0"),
             ]:
