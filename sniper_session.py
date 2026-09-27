@@ -96,13 +96,12 @@ def settings_from_db_row(row) -> SniperSettings:
     coins = [c.strip().upper() for c in str(wl).split(",") if c.strip()]
     if not coins:
         coins = list(DEFAULT_WATCHLIST)
-    max_positions = getattr(row, "max_positions", None)
     return SniperSettings(
         target_usdt=float(getattr(row, "target_usdt", None) or DEFAULT_TARGET_USDT),
         stop_usdt=float(getattr(row, "stop_usdt", None) or DEFAULT_STOP_USDT),
         min_size_usdt=float(getattr(row, "min_size_usdt", None) or DEFAULT_MIN_SIZE),
         max_size_usdt=float(getattr(row, "max_size_usdt", None) or DEFAULT_MAX_SIZE),
-        max_positions=int(max_positions if max_positions is not None else DEFAULT_MAX_POSITIONS),
+        max_positions=int(getattr(row, "max_positions", None) or DEFAULT_MAX_POSITIONS),
         sessions_planned=int(getattr(row, "sessions_planned", None) or DEFAULT_SESSIONS),
         trail_pct=float(getattr(row, "trail_pct", None) or DEFAULT_TRAIL_PCT),
         initial_sl_pct=float(getattr(row, "initial_sl_pct", None) or DEFAULT_INITIAL_SL_PCT),

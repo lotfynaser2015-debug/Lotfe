@@ -178,6 +178,45 @@ def update_sniper_config(db, telegram_id: int, **kwargs):
     return row
 
 
+
+
+class STConfig(Base):
+    """إعدادات متابع SuperTrend."""
+    __tablename__ = "st_config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    timeframe = Column(String(10), default="15m")
+    atr_period = Column(Integer, default=10)
+    multiplier = Column(Float, default=3.0)
+    size_usdt = Column(Float, default=50.0)
+    max_positions = Column(Integer, default=2)
+    auto_enabled = Column(Boolean, default=False)
+    confirm_before_entry = Column(Boolean, default=False)
+    watchlist = Column(Text, default="")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+def get_st_config(db, telegram_id: int):
+    row = db.query(STConfig).filter(STConfig.telegram_id == telegram_id).first()
+    if not row:
+        row = STConfig(telegram_id=telegram_id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    return row
+
+
+def update_st_config(db, telegram_id: int, **kwargs):
+    row = get_st_config(db, telegram_id)
+    for k, v in kwargs.items():
+        if hasattr(row, k) and v is not None:
+            setattr(row, k, v)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 
