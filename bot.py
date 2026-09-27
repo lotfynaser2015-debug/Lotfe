@@ -657,7 +657,7 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if sniper_field == "sessions_planned":
                     val = max(1, min(10, int(val)))
                 if sniper_field == "max_positions":
-                    val = max(1, min(3, int(val)))
+                    val = max(0, min(20, int(val)))  # 0 = بدون دخول جديد، حتى 20 كحد أقصى
                 db = SessionLocal()
                 try:
                     update_sniper_config(db, update.effective_user.id, **{sniper_field: val})
@@ -970,7 +970,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "min_size_usdt": "أقل حجم صفقة $",
             "max_size_usdt": "أقصى حجم صفقة $",
             "sessions_planned": "عدد الجلسات المتتالية (1–10)",
-            "max_positions": "أقصى مراكز مفتوحة (1–3)",
+            "max_positions": "أقصى مراكز (0=بدون دخول، 1–20 حد أقصى — مش إجباري تتفتح كلها)",
         }
         context.user_data["waiting"] = True
         context.user_data["edit_sniper_field"] = field
