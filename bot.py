@@ -838,6 +838,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("أقصى مراكز", callback_data="sniper_set_max_positions"),
             ])
             rows.append([InlineKeyboardButton("📝 سلة العملات", callback_data="sniper_watchlist")])
+            cont = "🟢" if s.continue_after_loss else "⚪"
+            rows.append([InlineKeyboardButton(
+                f"{cont} كمّل بعد وقف الخسارة",
+                callback_data="sniper_toggle_continue_loss",
+            )])
             rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="sniper_menu")])
             rows.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu")])
             await query.edit_message_text(
@@ -908,6 +913,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+
+
+    if data == "sniper_toggle_continue_loss":
+        db = SessionLocal()
+        try:
+            cfg = get_sniper_config(db, tid)
+            new_val = not bool(getattr(cfg, "continue_after_loss", False))
+            update_sniper_config(db, tid, continue_after_loss=new_val)
+            rt = get_sniper_runtime()
+            rt.settings.continue_after_loss = new_val
+            if not rt.active:
+                rt.settings = settings_from_db_row(get_sniper_config(db, tid))
+            state = "مفعّل — هيكمل باقي الجلسات حتى بعد الخسارة" if new_val else "معطّل — يوقف بعد أول وقف خسارة"
+            await query.edit_message_text(
+                f"{'🟢' if new_val else '⚪'} *كمّل بعد وقف الخسارة*\n{state}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎯 السنايبر", callback_data="sniper_menu")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
 
     if data == "sniper_watchlist":
         db = SessionLocal()
