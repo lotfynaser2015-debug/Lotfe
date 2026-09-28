@@ -1896,7 +1896,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
         refresh_errors = []
         already_done = set(bought) | {t.split("(")[0] for t in topped}
 
-        for coin, amt, price, val, need in coin_status:
+        for coin, amt, price, val, need, excess in coin_status:
             if coin.symbol in already_done:
                 if coin.symbol not in refreshed:
                     refreshed.append(coin.symbol)
