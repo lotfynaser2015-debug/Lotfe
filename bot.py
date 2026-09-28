@@ -192,11 +192,8 @@ def _missing_reentry_keyboard(pf_id: int, missing_symbols, selected, allow_selec
 def format_pf(p, current_value: float = None, prices: dict = None, events=None) -> str:
     """عرض مبسّط: الربح/الخسارة من أساس آخر إعادة بناء."""
     status = "🟢 شغالة" if p.is_running else "⚪ متوقفة"
-    mode = (
-        "يدوي: أهداف + وقف ثابت"
-        if str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual"
-        else "ذكي: وقف متحرك"
-    )
+    is_manual = str(getattr(p, "control_mode", "smart") or "smart").lower() == "manual"
+    mode = "يدوي" if is_manual else "آلي (ذكي)"
     prices = prices or {}
     events = events or []
 
@@ -258,26 +255,39 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
         except Exception:
             pass
 
+    allocated = float(p.investment_usdt or 0)
+    n_coins = len([c for c in p.coins]) if p.coins else 0
+    per_coin = (allocated / n_coins) if n_coins else 0.0
+    # حالة المحفظة: أخضر / أصفر / أحمر
+    if not p.is_running:
+        health = "⚪ متوقفة"
+    elif total_pct <= -5:
+        health = "🔴 أحمر — احترس"
+    elif total_pct <= -1.5:
+        health = "🟡 أصفر — راقب"
+    elif total_pct >= 1.5:
+        health = "🟢 أخضر — في ربح"
+    else:
+        health = "🟢 مستقر"
+
     out = [
-        f"📁 *{p.name}*  `#{p.id}`",
+        f"📁 *{p.name}*",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"الحالة: *{status}*",
         f"التحكم: *{mode}*",
-        f"أساس آخر إعادة بناء: *{baseline:.2f}* USDT",
-        f"القيمة الآن: *{open_value:.2f}* USDT",
-        f"{t_emoji} الربح/الخسارة: *{total_pnl:+.2f}* USDT (*{total_pct:+.2f}%*)",
+        f"المخصص: *{allocated:.0f}* USDT",
+        f"عدد العملات: *{n_coins}* | نصيب كل عملة: *{per_coin:.2f}* $",
+        f"آخر تشغيل بدأ بـ: *{baseline:.2f}* $",
+        f"الرصيد الحالي (عائم): *{open_value:.2f}* $",
+        f"الربح/الخسارة: *{total_pnl:+.2f}* $ (*{total_pct:+.2f}%*)",
+        f"وضع المحفظة: *{health}*",
     ]
     if abs(realized) > 0.0001:
         r_emoji = "🟢" if realized >= 0 else "🔴"
-        out.append(f"{r_emoji} منه محقق (بيعات): *{realized:+.2f}* USDT")
-    if rebuild_txt:
-        out.append(rebuild_txt.strip())
+        out.append(f"{r_emoji} محقق من بيوعات: *{realized:+.2f}* $")
     out.append("")
-    out.append(f"*العملات* ({len(symbols)})")
+    out.append(f"العملات ({len(symbols)})")
     out.append(coins_block)
     return "\n".join(out)
-
-
 def format_portfolio_stats(p, events, prices=None) -> str:
     """Format realized and current unrealized P&L for one portfolio."""
     prices = prices or {}
@@ -849,7 +859,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="st_menu")])
             rows.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu")])
             await query.edit_message_text(
-                text + "\n\n_يدوي: أرسل رمز عملة أثناء التشغيل (مثال SEI)_",
+                text + "\n\n_يدوي: أرسل رمزًا أثناء التشغيل_\n⚠️ لا تشغّل التلقائي فوق محافظ مفتوحة لنفس العملات",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(rows),
             )
@@ -1690,11 +1700,11 @@ async def _do_rebuild_positions(query, tid, pf_id):
         target_per_coin = allocated / n_coins if n_coins > 0 else 0.0
         free_usdt = client.get_free_usdt()
 
-        # هدف كل عملة = التخصيص ÷ العدد
-        # أي فرق ≥ 1$ يُشترى من رصيد USDT المتاح في الحساب (حتى من خارج المحفظة)
-        coin_status = []  # (coin, amount, price, market_value, need_buy_usdt)
+        # هدف كل عملة = التخصيص ÷ العدد — توازن حقيقي: بيع الزائد + تكميل الناقص
+        coin_status = []  # (coin, amount, price, market_value, need_buy, excess_sell)
         total_value = 0.0
         total_need = 0.0
+        total_excess = 0.0
         for coin in p.coins:
             info = presence.get(coin.symbol) or presence.get(coin.symbol.upper()) or {}
             val = float(info.get("market_value") or 0)
@@ -1704,38 +1714,124 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 val = 0.0
                 amt = 0.0
             need = max(0.0, target_per_coin - val)
-            # تجاهل فرق أقل من 1$ (غبار)
+            excess = max(0.0, val - target_per_coin)
             if need < 1.0:
                 need = 0.0
+            if excess < 1.0:
+                excess = 0.0
             total_value += val
             total_need += need
-            coin_status.append((coin, amt, price, val, need))
+            total_excess += excess
+            coin_status.append((coin, amt, price, val, need, excess))
 
         under = [x for x in coin_status if x[4] >= 1.0]
-        ok_coins = [x for x in coin_status if x[4] < 1.0]
+        overweight = [x for x in coin_status if x[5] >= 1.0]
+        ok_coins = [x for x in coin_status if x[4] < 1.0 and x[5] < 1.0]
 
         await query.edit_message_text(
             f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"① أُلغي `{cancelled_count}` أمر قديم\n"
-            f"② هدف كل عملة: *`{target_per_coin:.2f}$`*  (إجمالي `{allocated:.0f}$`)\n"
-            f"القيمة الحالية: `{total_value:.2f}$` | الناقص: `{total_need:.2f}$`\n"
-            f"USDT متاح في الحساب: `{free_usdt:.2f}$`\n"
-            f"يحتاج تكميل: `{len(under)}` | مكتمل: `{len(ok_coins)}`\n"
-            "③ شراء/تكميل من رصيد الحساب...",
+            f"② هدف كل عملة: *`{target_per_coin:.2f}$`*  (مخصص `{allocated:.0f}$`)\n"
+            f"القيمة الحالية: `{total_value:.2f}$`\n"
+            f"ناقص: `{total_need:.2f}$` | زائد للبيع: `{total_excess:.2f}$`\n"
+            f"USDT متاح: `{free_usdt:.2f}$`\n"
+            f"تحت الهدف: `{len(under)}` | فوق الهدف: `{len(overweight)}` | متوازن: `{len(ok_coins)}`\n"
+            "③ بيع الزائد ثم تكميل الناقص...",
             parse_mode="Markdown",
         )
 
-        # 3) تكميل كل عملة تحت الهدف من USDT المتاح (حتى من خارج المحفظة)
+        sold_trim = []
+        sell_errors = []
+        total_sold_usdt = 0.0
+
+        # 3أ) بيع الزائد حتى كل عملة ≈ الهدف (مايتخطاش المخصص للفرد)
+        for coin, amt, price, val, need, excess in overweight:
+            try:
+                px = price if price > 0 else float(client.get_ticker_price(f"{coin.symbol}/{client.quote}") or 0)
+                if px <= 0 or amt <= 0:
+                    continue
+                sell_amt = (excess / px) * 0.998
+                free_amt = float(client.get_free_amount(coin.symbol) or 0)
+                # بعد إلغاء الأوامر يفترض الرصيد حر؛ لو مقفول نحاول الإجمالي
+                if free_amt < sell_amt * 0.5:
+                    try:
+                        client.cancel_all_open_sells(coin.symbol)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.4)
+                    free_amt = float(client.get_free_amount(coin.symbol) or 0)
+                sell_amt = min(sell_amt, free_amt * 0.998) if free_amt > 0 else sell_amt
+                if sell_amt * px < 1.0:
+                    continue
+                order = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda s=coin.symbol, a=sell_amt: client.create_market_order(
+                        f"{s}/{client.quote}", "sell", a
+                    ),
+                )
+                if order is None:
+                    sell_errors.append(f"{coin.symbol}: غبار تحت الحد الأدنى")
+                    continue
+                got = sell_amt * px
+                total_sold_usdt += got
+                sold_trim.append(f"{coin.symbol}(-{got:.1f}$)")
+                new_amt = max(0.0, amt - sell_amt)
+                update_coin_position(
+                    db, coin.id,
+                    amount=new_amt,
+                    remaining_amount=new_amt,
+                )
+                logger.info(
+                    "rebuild trim sell %s excess=%.2f sold_amt=%.6g",
+                    coin.symbol, excess, sell_amt,
+                )
+            except Exception as exc:
+                sell_errors.append(f"{coin.symbol}: {exc}")
+                logger.exception("rebuild trim %s", coin.symbol)
+
+        # حدّث الحضور بعد البيع
+        await asyncio.sleep(1.0)
+        presence = client.get_portfolio_presence(symbols)
+        free_usdt = client.get_free_usdt()
+
+        # أعد حساب الناقص بعد التشذيب
+        under = []
+        for coin in p.coins:
+            info = presence.get(coin.symbol) or presence.get(coin.symbol.upper()) or {}
+            val = float(info.get("market_value") or 0)
+            amt = float(info.get("amount") or 0)
+            price = float(info.get("price") or 0)
+            if amt <= 0 or val < min_usdt:
+                val = 0.0
+                amt = 0.0
+            need = max(0.0, target_per_coin - val)
+            if need < 1.0:
+                need = 0.0
+            if need >= 1.0:
+                under.append((coin, amt, price, val, need))
+
+        # 3ب) تكميل الناقص — لا نتجاوز المخصص الإجمالي تقريبًا
         bought = []
         topped = []
         buy_errors = []
         total_spent = 0.0
+        # سقف الإنفاق: المخصص - القيمة الحالية بعد البيع + هامش صغير
+        try:
+            cur_after = sum(
+                float((presence.get(c.symbol) or presence.get(c.symbol.upper()) or {}).get("market_value") or 0)
+                for c in p.coins
+            )
+        except Exception:
+            cur_after = total_value - total_sold_usdt
+        budget_left = max(0.0, allocated - cur_after) + total_sold_usdt * 0.1
 
         for coin, amt, price, val, need in under:
             # حدّث الرصيد الحر قبل كل شراء
             free_usdt = client.get_free_usdt()
             buy_amt = min(need, free_usdt * 0.995)
+            if budget_left > 0:
+                buy_amt = min(buy_amt, budget_left)
             if buy_amt < 1.0:
                 buy_errors.append(
                     f"{coin.symbol}: يحتاج `{need:.2f}$` لكن USDT المتاح `{free_usdt:.2f}$`"
@@ -1776,6 +1872,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 )
                 mark_reentry_events_used(db, p.id, coin.symbol)
                 total_spent += buy_amt
+                budget_left = max(0.0, budget_left - buy_amt)
                 if val < min_usdt:
                     bought.append(coin.symbol)
                 else:
@@ -1886,7 +1983,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
         log_action(
             db, tid, "rebuild_positions",
             f"Rebuild {p.name}: target={target_per_coin:.2f} cancel={cancelled_count} "
-            f"buy={bought} top={topped} spent={total_spent:.2f}",
+            f"trim={sold_trim} buy={bought} top={topped} spent={total_spent:.2f} sold={total_sold_usdt:.2f}",
             not (buy_errors or refresh_errors),
             pf_id,
         )
@@ -1899,13 +1996,14 @@ async def _do_rebuild_positions(query, tid, pf_id):
             f"💰 التخصيص: `{allocated:.0f}$` ÷ `{n_coins}` = *`{target_per_coin:.2f}$`* لكل عملة",
             f"📊 كانت القيمة: `{total_value:.2f}$` | الناقص: `{total_need:.2f}$`",
             f"🗑 أوامر قديمة ملغاة: `{cancelled_count}`",
+            f"🔻 بيع الزائد: `{len(sold_trim)}`" + (f" — {', '.join(f'`{x}`' for x in sold_trim[:8])}" if sold_trim else ""),
             f"🛒 عملات جديدة: `{len(bought)}`" + (f" — {', '.join(f'`{x}`' for x in bought)}" if bought else ""),
             f"📈 تم تكميل: `{len(topped)}`" + (f" — {', '.join(f'`{x}`' for x in topped[:8])}" if topped else ""),
-            f"💵 صُرف من الحساب: `{total_spent:.2f}$` | USDT متبقي: `{free_after:.2f}$`",
+            f"💵 صُرف: `{total_spent:.2f}$` | من البيع: `{total_sold_usdt:.2f}$` | USDT: `{free_after:.2f}$`",
             f"🎯 أهداف/وقف وُضعت لـ: `{len(refreshed)}` عملة",
             f"📌 أساس الحساب من الآن: *`{float(p.base_investment or 0):.2f}$`* (آخر إعادة بناء)",
         ]
-        all_errs = cancel_errors[:3] + buy_errors + refresh_errors
+        all_errs = cancel_errors[:3] + sell_errors + buy_errors + refresh_errors
         if all_errs:
             lines.append("\n⚠️ ملاحظات:")
             for e in all_errs[:10]:

@@ -184,6 +184,23 @@ def _buy(client, symbol: str, settings: STSettings, mode: str) -> Optional[str]:
         return None
     if len(rt.positions) >= settings.max_positions:
         return f"⚠️ وصلنا لأقصى مراكز (`{settings.max_positions}`) — تخطي `{symbol}`"
+
+    # لا نشتري فوق رصيد محفظة قائم — يمنع تضخيم عملة واحدة (WLD/ONDO…)
+    try:
+        total_amt = float(client.get_total_amount(symbol) or 0)
+        px = float(client.get_ticker_price(f"{symbol}/USDT") or 0)
+        existing_usdt = total_amt * px if px > 0 else 0.0
+    except Exception:
+        existing_usdt = 0.0
+    if existing_usdt >= max(8.0, settings.size_usdt * 0.4):
+        log_st(
+            "skip_existing_balance",
+            symbol=symbol,
+            existing_usdt=existing_usdt,
+            reason="coin_already_held_likely_portfolio",
+        )
+        return None
+
     try:
         free = float(client.get_free_usdt() or 0)
     except Exception:
