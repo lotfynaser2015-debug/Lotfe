@@ -19,17 +19,16 @@ from telegram.ext import (
 )
 
 import config
-import st_follower
-from st_follower import (
-    settings_from_row as st_settings_from_row,
-    start_follower, stop_follower, status_text as st_status_text,
-    tick as st_tick, get_runtime as get_st_runtime,
-    add_manual_symbol, remove_manual_symbol,
+import cpr_follower
+from cpr_follower import (
+    settings_from_row as cpr_settings_from_row,
+    start_cpr, stop_cpr, status_text as cpr_status_text,
+    stats_text as cpr_stats_text, tick as cpr_tick,
+    get_runtime as get_cpr_runtime, DEFAULT_COINS as CPR_DEFAULT_COINS,
 )
-from st_follower import DEFAULT_WATCHLIST as ST_DEFAULT_WATCHLIST
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
-    get_st_config, update_st_config,
+    get_cpr_config, update_cpr_config,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
     close_portfolio, delete_portfolio_completely, clear_coin_position,
     delete_orphaned_portfolio_records,
@@ -131,7 +130,7 @@ def main_menu_keyboard():
             InlineKeyboardButton("📋 محافظي", callback_data="list_pf"),
             InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf"),
         ],
-        [InlineKeyboardButton("📈 SuperTrend", callback_data="st_menu")],
+        [InlineKeyboardButton("📈 CPR (تجريبي/حقيقي)", callback_data="cpr_menu")],
         [InlineKeyboardButton("📡 حالة السوق", callback_data="auto_sys_status")],
         [InlineKeyboardButton("💰 الرصيد", callback_data="balance")],
         [
@@ -620,15 +619,15 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("waiting"):
         # تعديل إعدادات عامة
-        st_field = context.user_data.get("edit_st_field")
-        if st_field:
+        cpr_field = context.user_data.get("edit_cpr_field")
+        if cpr_field:
             try:
                 raw = text.strip()
                 db = SessionLocal()
                 try:
-                    if st_field == "watchlist":
+                    if cpr_field == "coins":
                         if raw in ("افتراضي", "default", "DEFAULT"):
-                            coins = list(ST_DEFAULT_WATCHLIST)
+                            coins = list(CPR_DEFAULT_COINS)
                         else:
                             coins = []
                             for part in raw.replace("\n", ",").split(","):
@@ -638,61 +637,42 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if not coins:
                             await update.message.reply_text("لا رموز صالحة.")
                             return
-                        update_st_config(db, update.effective_user.id, watchlist=",".join(coins))
-                        val_show = f"{len(coins)} عملة"
-                    elif st_field == "timeframe":
-                        tf = raw.lower().replace(" ", "")
-                        if tf not in ("1m", "5m", "15m", "30m", "1h", "4h"):
-                            await update.message.reply_text("استخدم: 5m أو 15m أو 1h")
+                        if len(coins) > 40:
+                            await update.message.reply_text("الحد 40 عملة.")
                             return
-                        update_st_config(db, update.effective_user.id, timeframe=tf)
-                        val_show = tf
-                    elif st_field == "max_positions":
+                        update_cpr_config(db, update.effective_user.id, coins=",".join(coins))
+                        val_show = f"{len(coins)} عملة"
+                    elif cpr_field == "investment_usdt":
+                        val = max(20.0, min(100000.0, float(raw.replace(",", ".").replace("$", ""))))
+                        update_cpr_config(db, update.effective_user.id, investment_usdt=val)
+                        val_show = val
+                    elif cpr_field == "size_usdt":
+                        val = max(5.0, min(5000.0, float(raw.replace(",", ".").replace("$", ""))))
+                        update_cpr_config(db, update.effective_user.id, size_usdt=val)
+                        val_show = val
+                    elif cpr_field == "max_positions":
                         val = max(1, min(20, int(float(raw))))
-                        update_st_config(db, update.effective_user.id, max_positions=val)
-                        val_show = val
-                    elif st_field == "atr_period":
-                        val = max(5, min(50, int(float(raw))))
-                        update_st_config(db, update.effective_user.id, atr_period=val)
-                        val_show = val
-                    elif st_field == "multiplier":
-                        val = max(1.0, min(10.0, float(raw.replace(",", "."))))
-                        update_st_config(db, update.effective_user.id, multiplier=val)
-                        val_show = val
-                    elif st_field == "size_usdt":
-                        val = max(10.0, min(5000.0, float(raw.replace(",", ".").replace("$", ""))))
-                        update_st_config(db, update.effective_user.id, size_usdt=val)
+                        update_cpr_config(db, update.effective_user.id, max_positions=val)
                         val_show = val
                     else:
                         await update.message.reply_text("حقل غير معروف")
                         return
-                    cfg = get_st_config(db, update.effective_user.id)
-                    rt = get_st_runtime()
-                    rt.settings = st_settings_from_row(cfg)
+                    cfg = get_cpr_config(db, update.effective_user.id)
+                    rt = get_cpr_runtime()
+                    if not rt.active:
+                        rt.settings = cpr_settings_from_row(cfg)
                 finally:
                     db.close()
-                context.user_data.pop("edit_st_field", None)
+                context.user_data.pop("edit_cpr_field", None)
                 context.user_data.pop("waiting", None)
                 await update.message.reply_text(
-                    f"✅ SuperTrend: `{st_field}` = `{val_show}`",
+                    f"✅ CPR: `{cpr_field}` = `{val_show}`",
                     parse_mode="Markdown",
                     reply_markup=main_menu_keyboard(),
                 )
             except Exception as e:
                 await update.message.reply_text(f"خطأ: {e}")
             return
-
-        # يدوي: رمز عملة أثناء تشغيل المتابع
-        try:
-            rt_st = get_st_runtime()
-            if rt_st.active and not context.user_data.get("waiting") and not context.user_data.get("edit_user_tpsl"):
-                maybe = text.strip().upper().replace("/USDT", "")
-                if maybe.isalnum() and 2 <= len(maybe) <= 12 and maybe not in ("MENU", "START", "HELP", "STOP"):
-                    reply = add_manual_symbol(maybe)
-                    await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-                    return
-        except Exception:
-            pass
 
         user_field = context.user_data.get("edit_user_tpsl")
         if user_field:
@@ -827,39 +807,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    # ========== SuperTrend ==========
-    if data == "st_menu":
+
+    # ========== CPR ==========
+    if data == "cpr_menu":
         db = SessionLocal()
         try:
-            cfg = get_st_config(db, tid)
-            s = st_settings_from_row(cfg)
-            rt = get_st_runtime()
+            cfg = get_cpr_config(db, tid)
+            s = cpr_settings_from_row(cfg)
+            rt = get_cpr_runtime()
             if not rt.active:
                 rt.settings = s
-            text = st_status_text()
+            text = cpr_status_text(get_mexc() if rt.active else None)
             rows = []
             if not rt.active:
-                rows.append([InlineKeyboardButton("▶️ تشغيل المتابع", callback_data="st_start")])
+                rows.append([InlineKeyboardButton("▶️ تشغيل", callback_data="cpr_start")])
             else:
-                rows.append([InlineKeyboardButton("⏹ إيقاف", callback_data="st_stop")])
+                rows.append([InlineKeyboardButton("⏹ إيقاف", callback_data="cpr_stop")])
+            mode_lab = "🧪 تجريبي" if s.mode == "paper" else "💰 حقيقي"
+            rows.append([InlineKeyboardButton(f"الوضع: {mode_lab}", callback_data="cpr_toggle_mode")])
             rows.append([
-                InlineKeyboardButton(f"فريم: {s.timeframe}", callback_data="st_set_timeframe"),
-                InlineKeyboardButton(f"حجم ${s.size_usdt:g}", callback_data="st_set_size_usdt"),
+                InlineKeyboardButton(f"رأس المال ${s.investment_usdt:g}", callback_data="cpr_set_investment_usdt"),
+                InlineKeyboardButton(f"صفقة ${s.size_usdt:g}", callback_data="cpr_set_size_usdt"),
             ])
             rows.append([
-                InlineKeyboardButton(f"ATR {s.atr_period}", callback_data="st_set_atr_period"),
-                InlineKeyboardButton(f"مضاعف {s.multiplier:g}", callback_data="st_set_multiplier"),
+                InlineKeyboardButton(f"أقصى مراكز {s.max_positions}", callback_data="cpr_set_max_positions"),
+                InlineKeyboardButton(f"عملات ({len(s.coins)})", callback_data="cpr_set_coins"),
             ])
-            rows.append([
-                InlineKeyboardButton(f"أقصى مراكز {s.max_positions}", callback_data="st_set_max_positions"),
-            ])
-            auto_lab = "🟢 تلقائي ON" if s.auto_enabled else "⚪ تلقائي OFF"
-            rows.append([InlineKeyboardButton(auto_lab, callback_data="st_toggle_auto")])
-            rows.append([InlineKeyboardButton("📝 سلة التلقائي", callback_data="st_watchlist")])
-            rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="st_menu")])
+            rows.append([InlineKeyboardButton("📊 النتائج", callback_data="cpr_stats")])
+            rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="cpr_menu")])
             rows.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu")])
             await query.edit_message_text(
-                text + "\n\n_يدوي: أرسل رمزًا أثناء التشغيل_\n⚠️ لا تشغّل التلقائي فوق محافظ مفتوحة لنفس العملات",
+                text,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(rows),
             )
@@ -867,94 +845,118 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.close()
         return
 
-    if data == "st_start":
+    if data == "cpr_start":
         db = SessionLocal()
         try:
-            cfg = get_st_config(db, tid)
-            s = st_settings_from_row(cfg)
-            msg = start_follower(tid, s)
-            log_action(db, tid, "st_start", "start", True)
+            cfg = get_cpr_config(db, tid)
+            s = cpr_settings_from_row(cfg)
+            if s.mode == "live":
+                await query.edit_message_text(
+                    "⚠️ *وضع حقيقي* — سيتم تنفيذ أوامر على MEXC.\nتأكيد؟",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ تأكيد تشغيل حقيقي", callback_data="cpr_start_live")],
+                        [InlineKeyboardButton("⬅️ رجوع", callback_data="cpr_menu")],
+                    ]),
+                )
+                return
+            msg = start_cpr(tid, s)
+            log_action(db, tid, "cpr_start", s.mode, True)
             await query.edit_message_text(
                 msg, parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⏹ إيقاف", callback_data="st_stop")],
-                    [InlineKeyboardButton("📈 الحالة", callback_data="st_menu")],
+                    [InlineKeyboardButton("⏹ إيقاف", callback_data="cpr_stop")],
+                    [InlineKeyboardButton("📊 نتائج", callback_data="cpr_stats")],
+                    [InlineKeyboardButton("📈 CPR", callback_data="cpr_menu")],
                 ]),
             )
         finally:
             db.close()
         return
 
-    if data == "st_stop":
-        msg = stop_follower(get_mexc(), reason="manual")
+    if data == "cpr_start_live":
+        db = SessionLocal()
+        try:
+            cfg = get_cpr_config(db, tid)
+            s = cpr_settings_from_row(cfg)
+            s.mode = "live"
+            update_cpr_config(db, tid, mode="live")
+            msg = start_cpr(tid, s)
+            log_action(db, tid, "cpr_start_live", "live", True)
+            await query.edit_message_text(
+                msg, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏹ إيقاف", callback_data="cpr_stop")],
+                    [InlineKeyboardButton("📈 CPR", callback_data="cpr_menu")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
+
+    if data == "cpr_stop":
+        msg = stop_cpr(get_mexc(), reason="manual")
         await query.edit_message_text(
             msg, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📈 SuperTrend", callback_data="st_menu")],
+                [InlineKeyboardButton("📈 CPR", callback_data="cpr_menu")],
                 [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
             ]),
         )
         return
 
-    if data == "st_toggle_auto":
+    if data == "cpr_toggle_mode":
         db = SessionLocal()
         try:
-            cfg = get_st_config(db, tid)
-            new_val = not bool(getattr(cfg, "auto_enabled", False))
-            update_st_config(db, tid, auto_enabled=new_val)
-            rt = get_st_runtime()
-            rt.settings.auto_enabled = new_val
-            if not rt.active:
-                rt.settings = st_settings_from_row(get_st_config(db, tid))
+            cfg = get_cpr_config(db, tid)
+            rt = get_cpr_runtime()
+            if rt.active:
+                await query.edit_message_text(
+                    "أوقف المتابع أولاً قبل تغيير الوضع.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📈 CPR", callback_data="cpr_menu")],
+                    ]),
+                )
+                return
+            new_mode = "live" if (cfg.mode or "paper") == "paper" else "paper"
+            update_cpr_config(db, tid, mode=new_mode)
+            ar = "حقيقي 💰" if new_mode == "live" else "تجريبي 🧪"
             await query.edit_message_text(
-                f"{'🟢' if new_val else '⚪'} التلقائي على السلة: *{'مفعّل' if new_val else 'معطّل'}*",
+                f"تم اختيار الوضع: *{ar}*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📈 SuperTrend", callback_data="st_menu")],
+                    [InlineKeyboardButton("📈 CPR", callback_data="cpr_menu")],
                 ]),
             )
         finally:
             db.close()
         return
 
-    if data == "st_watchlist":
-        db = SessionLocal()
-        try:
-            cfg = get_st_config(db, tid)
-            s = st_settings_from_row(cfg)
-            preview = ", ".join(s.watchlist)
-            if len(preview) > 700:
-                preview = preview[:700] + "…"
-            context.user_data["waiting"] = True
-            context.user_data["edit_st_field"] = "watchlist"
-            await query.edit_message_text(
-                f"📝 *سلة التلقائي* ({len(s.watchlist)})\n`{preview}`\n\n"
-                "أرسل الرموز بفاصلة أو `افتراضي`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ رجوع", callback_data="st_menu")],
-                ]),
-            )
-        finally:
-            db.close()
+    if data == "cpr_stats":
+        await query.edit_message_text(
+            cpr_stats_text(),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📈 CPR", callback_data="cpr_menu")],
+            ]),
+        )
         return
 
-    if data.startswith("st_set_"):
-        field = data[len("st_set_"):]
+    if data.startswith("cpr_set_"):
+        field = data[len("cpr_set_"):]
         labels = {
-            "timeframe": "الفريم (5m أو 15m أو 1h)",
-            "size_usdt": "حجم الصفقة بالدولار",
-            "atr_period": "فترة ATR (مثال 10)",
-            "multiplier": "مضاعف SuperTrend (مثال 3)",
-            "max_positions": "أقصى مراكز (1–20)",
+            "investment_usdt": "رأس المال العام بالدولار (مثال: 100)",
+            "size_usdt": "حجم الصفقة الواحدة $",
+            "max_positions": "أقصى مراكز مفتوحة (1–20)",
+            "coins": "العملات بفاصلة (مثال: BTC,ETH,SEI) أو افتراضي",
         }
         context.user_data["waiting"] = True
-        context.user_data["edit_st_field"] = field
+        context.user_data["edit_cpr_field"] = field
         await query.edit_message_text(
             f"أرسل *{labels.get(field, field)}*:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ رجوع", callback_data="st_menu")],
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="cpr_menu")],
             ]),
         )
         return
@@ -3674,15 +3676,15 @@ async def smart_levels_refresh_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def st_job(context: ContextTypes.DEFAULT_TYPE):
+async def cpr_job(context: ContextTypes.DEFAULT_TYPE):
     """دورة السنايبر — منفصلة عن مراقبة المحافظ."""
     import asyncio
-    rt = get_st_runtime()
+    rt = get_cpr_runtime()
     if not rt.active:
         return
     try:
         loop = asyncio.get_event_loop()
-        msgs = await loop.run_in_executor(None, lambda: st_tick(get_mexc()))
+        msgs = await loop.run_in_executor(None, lambda: cpr_tick(get_mexc()))
         for m in msgs:
             tid = rt.telegram_id
             if not tid:
@@ -3690,9 +3692,9 @@ async def st_job(context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(tid, m["text"], parse_mode="Markdown")
             except Exception:
-                logger.exception("st notify fail")
+                logger.exception("cpr notify fail")
     except Exception:
-        logger.exception("st_job error")
+        logger.exception("cpr_job error")
 
 
 async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
@@ -4197,12 +4199,12 @@ def main():
     # Cloud monitor for TP/SL every 25 seconds
     if app.job_queue:
         app.job_queue.run_repeating(
-            st_job,
+            cpr_job,
             interval=45,
             first=20,
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
         )
-        logger.info("SuperTrend job scheduled (every 45s)")
+        logger.info("CPR job scheduled (every 45s)")
         app.job_queue.run_repeating(
             monitor_positions_job,
             interval=60,

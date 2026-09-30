@@ -217,6 +217,44 @@ def update_st_config(db, telegram_id: int, **kwargs):
     return row
 
 
+
+
+class CPRConfig(Base):
+    """إعدادات متابع CPR — تجريبي أو حقيقي."""
+    __tablename__ = "cpr_config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    mode = Column(String(10), default="paper")  # paper | live
+    investment_usdt = Column(Float, default=100.0)
+    size_usdt = Column(Float, default=15.0)
+    max_positions = Column(Integer, default=3)
+    coins = Column(Text, default="")
+    take_r1 = Column(Boolean, default=True)
+    exit_on_bc = Column(Boolean, default=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+def get_cpr_config(db, telegram_id: int):
+    row = db.query(CPRConfig).filter(CPRConfig.telegram_id == telegram_id).first()
+    if not row:
+        row = CPRConfig(telegram_id=telegram_id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    return row
+
+
+def update_cpr_config(db, telegram_id: int, **kwargs):
+    row = get_cpr_config(db, telegram_id)
+    for k, v in kwargs.items():
+        if hasattr(row, k) and v is not None:
+            setattr(row, k, v)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 
