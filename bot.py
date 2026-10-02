@@ -4,6 +4,7 @@
 """
 import logging
 import re
+import asyncio
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 
@@ -148,9 +149,8 @@ def pf_keyboard(pf_id: int, is_running: bool):
             InlineKeyboardButton("➖ عملة", callback_data=f"removecoin_{pf_id}"),
         ],
         [InlineKeyboardButton("🧠 ذكي / ✍️ يدوي", callback_data=f"mode_{pf_id}")],
-        [
-            InlineKeyboardButton("🎯 اصطياد الانهيار", callback_data=f"crash_{pf_id}"),
-        ],
+        [InlineKeyboardButton("💰 زيادة استثمار المحفظة", callback_data=f"increase_{pf_id}")],
+        [InlineKeyboardButton("🎯 اصطياد الانهيار", callback_data=f"crash_{pf_id}")],
         [
             InlineKeyboardButton("♻️ إعادة بناء", callback_data=f"rebuild_{pf_id}"),
             InlineKeyboardButton("🗑 حذف", callback_data=f"delete_pf_{pf_id}"),
@@ -824,13 +824,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"_يتطلب USDT متاح في الحساب. الأوامر معلّقة حتى يهبط السعر._"
             )
             rows = [
-                [InlineKeyboardButton("✍️ تنفيذ يدوي (السلم الحالي)", callback_data=f"crash_run_{pf_id}")],
-                [InlineKeyboardButton("🤖 تنفيذ تلقائي (تحليل السوق)", callback_data=f"crash_auto_{pf_id}")],
+                [InlineKeyboardButton("▶️ تشغيل اصطياد يدوي", callback_data=f"crash_run_{pf_id}")],
+                [InlineKeyboardButton("▶️ تشغيل اصطياد تلقائي", callback_data=f"crash_auto_{pf_id}")],
                 [
-                    InlineKeyboardButton("نسب السلم", callback_data=f"crash_set_levels_{pf_id}"),
-                    InlineKeyboardButton("الميزانية $", callback_data=f"crash_set_budget_{pf_id}"),
+                    InlineKeyboardButton("⚙️ نسب السلم", callback_data=f"crash_set_levels_{pf_id}"),
+                    InlineKeyboardButton("💵 الميزانية", callback_data=f"crash_set_budget_{pf_id}"),
                 ],
-                [InlineKeyboardButton("🗑 إلغاء أوامر الشراء المعلّقة", callback_data=f"crash_cancel_{pf_id}")],
+                [InlineKeyboardButton("⏹ إلغاء أوامر الشراء المعلّقة", callback_data=f"crash_cancel_{pf_id}")],
                 [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
             ]
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
@@ -3262,7 +3262,7 @@ async def add_coin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def increase_amount_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = float(update.message.text.strip().replace(",", ""))
+        amount = float(update.message.text.strip().replace(",", "").replace("$", ""))
         if amount <= 0:
             await update.message.reply_text("المبلغ لازم يكون موجب.")
             return INCREASE_AMOUNT
@@ -3277,17 +3277,65 @@ async def increase_amount_msg(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("غير موجودة.", reply_markup=main_menu_keyboard())
             context.user_data.clear()
             return ConversationHandler.END
-        p.investment_usdt += amount
+        coins = [c.symbol for c in (p.coins or [])]
+        if not coins:
+            await update.message.reply_text("المحفظة بدون عملات.", reply_markup=main_menu_keyboard())
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        # تحقق USDT المتاح
+        try:
+            free = float(get_mexc().get_free_usdt() or 0)
+        except Exception as e:
+            await update.message.reply_text(f"تعذر قراءة الرصيد: {e}")
+            return ConversationHandler.END
+        if free + 0.01 < amount:
+            await update.message.reply_text(
+                f"⛔ USDT المتاح `{free:.2f}$` أقل من مبلغ الزيادة `{amount:.2f}$`.",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        p.investment_usdt = float(p.investment_usdt or 0) + amount
         db.commit()
-        if p.is_running:
-            coins = [c.symbol for c in p.coins]
-            if coins:
-                get_reb().start_portfolio(coins=coins, total_usdt=amount,
-                                          method=p.allocation_method or "equal", min_trade_usdt=5.0, dry_run=False)
+
+        # توزيع بالتساوي: شراء إضافي لكل عملة
+        buy_result = {}
+        try:
+            buy_result = get_reb().start_portfolio(
+                coins=coins,
+                total_usdt=amount,
+                method="equal",
+                min_trade_usdt=5.0,
+                dry_run=False,
+            ) or {}
+        except Exception as e:
+            logger.exception("increase distribute")
+            await update.message.reply_text(
+                f"✅ المخصص صار `{p.investment_usdt:.2f}$` لكن فشل التوزيع: `{e}`",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(),
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        per = amount / len(coins) if coins else 0
         context.user_data.clear()
+        errs = buy_result.get("errors") or []
+        msg = (
+            "✅ *تم زيادة الاستثمار*\n"
+            f"المبلغ المضاف: `{amount:.2f}$`\n"
+            f"المخصص الجديد: `{float(p.investment_usdt):.2f}$`\n"
+            f"التوزيع: `{per:.2f}$` × `{len(coins)}` عملة"
+        )
+        if errs:
+            msg += "\n\n⚠️ ملاحظات:\n" + "\n".join(f"• {e}" for e in errs[:6])
         await update.message.reply_text(
-            f"✅ تم زيادة `{amount}` USDT\nالمخصص الجديد: `{p.investment_usdt:.2f}`",
-            parse_mode="Markdown", reply_markup=main_menu_keyboard())
+            msg, parse_mode="Markdown",
+            reply_markup=pf_keyboard(pf_id, bool(p.is_running)),
+        )
     finally:
         db.close()
     return ConversationHandler.END
@@ -4275,9 +4323,24 @@ def main():
         return ADD_COIN
 
     async def entry_increase(update, context):
-        # زيادة رأس المال صارت عبر إعادة البناء — نوجّه المستخدم
-        await on_callback(update, context)
-        return ConversationHandler.END
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await ensure_admin(update):
+            return ConversationHandler.END
+        data = query.data or ""
+        pf_id = int(data.split("_")[1])
+        context.user_data["increase_pf"] = pf_id
+        await query.edit_message_text(
+            "💰 *زيادة استثمار المحفظة*\n"
+            "للعملات المشتراة بالفعل — يُوزَّع المبلغ *بالتساوي* ويُشترى من USDT.\n"
+            "مثال: `20`\n"
+            "_مستقل عن اصطياد الانهيار._",
+            parse_mode="Markdown",
+        )
+        return INCREASE_AMOUNT
 
     conv = ConversationHandler(
         entry_points=[
