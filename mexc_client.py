@@ -435,6 +435,61 @@ class MexcClient:
                 return None
             raise Exception(f"Limit sell failed for {pair}: {str(e)}")
 
+    def create_limit_buy(self, symbol: str, amount: float, price: float) -> Optional[dict]:
+        """Place a limit buy order (crash-hunt ladder)."""
+        pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
+        try:
+            if not self.exchange.markets:
+                self.exchange.load_markets()
+            market = self.exchange.market(pair)
+            limits = market.get("limits") or {}
+            min_amount = float((limits.get("amount") or {}).get("min") or 0)
+            min_cost = float((limits.get("cost") or {}).get("min") or 1.0)
+            if min_cost <= 0:
+                min_cost = 1.0
+            amount = float(self.exchange.amount_to_precision(pair, amount))
+            price = float(self.exchange.price_to_precision(pair, price))
+            if amount <= 0 or price <= 0:
+                return None
+            if min_amount > 0 and amount < min_amount:
+                return None
+            if amount * price < min_cost:
+                return None
+            return self.exchange.create_order(
+                symbol=pair, type="limit", side="buy", amount=amount, price=price,
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if any(x in msg for x in (
+                "minimum amount", "min amount", "precision", "too small",
+                "minimum transaction", "cannot be less", "min notional", "30002",
+            )):
+                return None
+            raise Exception(f"Limit buy failed for {pair}: {str(e)}")
+
+    def cancel_open_buy_orders(self, symbol: str) -> dict:
+        """Cancel open BUY limit orders for a symbol (crash-hunt cleanup)."""
+        result = {"cancelled": [], "errors": []}
+        pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
+        try:
+            orders = self.fetch_open_orders(symbol)
+            for o in orders:
+                side = str(o.get("side") or "").lower()
+                if side != "buy":
+                    continue
+                oid = o.get("id")
+                if not oid:
+                    continue
+                try:
+                    self.cancel_order(str(oid), symbol, strict=False)
+                    result["cancelled"].append(str(oid))
+                except Exception as e:
+                    result["errors"].append(str(e)[:80])
+        except Exception as e:
+            result["errors"].append(str(e)[:80])
+        return result
+
+
     def cancel_order(self, order_id: str, symbol: str, strict: bool = False) -> Optional[dict]:
         """Cancel an open order by id."""
         pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
