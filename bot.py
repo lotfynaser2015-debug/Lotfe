@@ -2625,6 +2625,37 @@ async def _do_start(query, tid, pf_id):
             await query.edit_message_text("المحفظة شغالة مسبقاً.", reply_markup=pf_keyboard(pf_id, True))
             return
 
+        # شرط التشغيل: رصيد USDT المتاح على المنصة ≥ المخصص
+        allocated = float(p.investment_usdt or 0)
+        try:
+            loop = asyncio.get_event_loop()
+            free_usdt = await loop.run_in_executor(
+                None, lambda: float(get_mexc().get_free_usdt() or 0)
+            )
+        except Exception as exc:
+            logger.exception("USDT preflight failed")
+            await query.edit_message_text(
+                "⚠️ تعذر قراءة رصيد USDT من MEXC.\n"
+                f"الخطأ: `{exc}`",
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, False),
+            )
+            return
+
+        if allocated > 0 and free_usdt + 0.01 < allocated:
+            await query.edit_message_text(
+                f"⛔ *لا يمكن التشغيل*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"المخصص المطلوب: *`{allocated:.2f}`* USDT\n"
+                f"المتاح على المنصة: *`{free_usdt:.2f}`* USDT\n"
+                f"الناقص: *`{allocated - free_usdt:.2f}`* USDT\n\n"
+                f"حوّل USDT للحساب ثم أعد ▶️ تشغيل.",
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, False),
+            )
+            log_action(db, tid, "start_blocked_usdt", f"need={allocated:.2f} free={free_usdt:.2f}", False, pf_id)
+            return
+
         # Check the wallet before buying so restarting a stopped portfolio
         # cannot purchase coins that are already held.
         try:
