@@ -110,9 +110,12 @@ class Rebalancer:
             )
             return results
 
-        targets = self.calculate_targets(coins, method)
+        # توزيع متساوٍ حرفيًا — لا أوزان مختلفة
+        n = max(1, len(coins))
+        usdt_each = float(total_usdt) / n
+        targets = {c: (100.0 / n) for c in coins}
         for coin, pct in targets.items():
-            usdt_for_coin = total_usdt * (pct / 100.0)
+            usdt_for_coin = usdt_each
             if usdt_for_coin < min_trade_usdt:
                 results["errors"].append(f"`{coin}`: المبلغ صغير جداً ({usdt_for_coin:.2f}$)")
                 continue

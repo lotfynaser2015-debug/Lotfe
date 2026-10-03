@@ -128,6 +128,7 @@ def main_menu_keyboard():
             InlineKeyboardButton("📋 محافظي", callback_data="list_pf"),
             InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf"),
         ],
+        [InlineKeyboardButton("🎯 اصطياد الانهيار (كل المحافظ)", callback_data="crash_sys")],
         [InlineKeyboardButton("📡 حالة السوق", callback_data="auto_sys_status")],
         [InlineKeyboardButton("💰 الرصيد", callback_data="balance")],
         [
@@ -138,7 +139,7 @@ def main_menu_keyboard():
 
 
 def pf_keyboard(pf_id: int, is_running: bool):
-    """أزرار المحفظة + اصطياد الانهيار."""
+    """أزرار المحفظة."""
     rows = [
         [
             InlineKeyboardButton("▶️ تشغيل" if not is_running else "⏹ إيقاف", callback_data=f"toggle_{pf_id}"),
@@ -150,7 +151,6 @@ def pf_keyboard(pf_id: int, is_running: bool):
         ],
         [InlineKeyboardButton("🧠 ذكي / ✍️ يدوي", callback_data=f"mode_{pf_id}")],
         [InlineKeyboardButton("💰 زيادة استثمار المحفظة", callback_data=f"increase_{pf_id}")],
-        [InlineKeyboardButton("🎯 اصطياد الانهيار", callback_data=f"crash_{pf_id}")],
         [
             InlineKeyboardButton("♻️ إعادة بناء", callback_data=f"rebuild_{pf_id}"),
             InlineKeyboardButton("🗑 حذف", callback_data=f"delete_pf_{pf_id}"),
@@ -438,7 +438,6 @@ def _cleanup_report(plan: Dict) -> str:
 
 
 async def _show_cleanup_scan(query, context, tid):
-    import asyncio
 
     db = SessionLocal()
     try:
@@ -485,7 +484,6 @@ async def _show_cleanup_scan(query, context, tid):
 
 
 async def _do_cleanup(query, context, tid):
-    import asyncio
 
     db = SessionLocal()
     try:
@@ -637,7 +635,7 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data.pop("waiting", None)
                     await update.message.reply_text(
                         f"✅ نسب السلم: `{', '.join(str(x) for x in levels)}` %\n"
-                        f"افتح المحفظة → اصطياد الانهيار → تنفيذ يدوي",
+                        f"من القائمة → اصطياد الانهيار → تشغيل",
                         parse_mode="Markdown",
                         reply_markup=main_menu_keyboard(),
                     )
@@ -793,123 +791,137 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-    # ========== اصطياد الانهيار ==========
-    if data.startswith("crash_") and not data.startswith("crash_run_") and not data.startswith("crash_auto_") and not data.startswith("crash_set_") and not data.startswith("crash_cancel_"):
-        # crash_{pf_id}
-        try:
-            pf_id = int(data.split("_")[1])
-        except Exception:
-            return
+
+    # ========== اصطياد الانهيار (نظام عام لكل المحافظ) ==========
+    if data == "crash_sys" or data == "crash_menu":
         levels = context.user_data.get("crash_levels") or default_manual_levels()
-        budget = float(context.user_data.get("crash_budget") or 0) or None
+        budget = float(context.user_data.get("crash_budget") or 0)
         db = SessionLocal()
         try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p:
-                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
-                return
-            n = len(p.coins or [])
-            alloc = float(p.investment_usdt or 0)
-            if budget is None:
-                budget = max(20.0, alloc * 0.5) if alloc > 0 else 50.0
+            pfs = get_portfolios(db, tid, status="active") or []
+            symbols = []
+            seen = set()
+            for p in pfs:
+                for c in (p.coins or []):
+                    s = (c.symbol or "").upper()
+                    if s and s not in seen:
+                        seen.add(s)
+                        symbols.append(s)
+            if budget < 10:
+                budget = 50.0
             text = (
-                f"🎯 *اصطياد الانهيار* — `{p.name}`\n"
+                f"🎯 *اصطياد الانهيار — نظام عام*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"العملات في المحفظة: `{n}`\n"
-                f"المخصص: `{alloc:.0f}$`\n"
-                f"ميزانية الأوامر الآن: `{budget:.0f}$`\n"
+                f"يُطبَّق *مرة واحدة* على عملات *كل المحافظ*\n"
+                f"المحافظ: `{len(pfs)}` | العملات الفريدة: `{len(symbols)}`\n"
+                f"ميزانية الأوامر: `{budget:.0f}$`\n"
                 f"السلم اليدوي: `{', '.join(str(x) for x in levels)}` %\n\n"
-                f"*يدوي:* نسب أنت تحددها → أوامر حد شراء لكل العملات\n"
-                f"*تلقائي:* تحليل BTC يختار السلم ثم نفس الأوامر\n\n"
-                f"_يتطلب USDT متاح في الحساب. الأوامر معلّقة حتى يهبط السعر._"
+                f"▶️ يدوي: نسبك → أوامر حد شراء\n"
+                f"▶️ تلقائي: تحليل BTC يختار السلم ثم الأوامر\n\n"
+                f"_USDT يجب أن يكون متاحًا. الأوامر معلّقة حتى يهبط السعر._"
             )
             rows = [
-                [InlineKeyboardButton("▶️ تشغيل اصطياد يدوي", callback_data=f"crash_run_{pf_id}")],
-                [InlineKeyboardButton("▶️ تشغيل اصطياد تلقائي", callback_data=f"crash_auto_{pf_id}")],
+                [InlineKeyboardButton("▶️ تشغيل يدوي (كل المحافظ)", callback_data="crash_run_sys")],
+                [InlineKeyboardButton("▶️ تشغيل تلقائي (كل المحافظ)", callback_data="crash_auto_sys")],
                 [
-                    InlineKeyboardButton("⚙️ نسب السلم", callback_data=f"crash_set_levels_{pf_id}"),
-                    InlineKeyboardButton("💵 الميزانية", callback_data=f"crash_set_budget_{pf_id}"),
+                    InlineKeyboardButton("⚙️ نسب السلم", callback_data="crash_set_levels_sys"),
+                    InlineKeyboardButton("💵 الميزانية", callback_data="crash_set_budget_sys"),
                 ],
-                [InlineKeyboardButton("⏹ إلغاء أوامر الشراء المعلّقة", callback_data=f"crash_cancel_{pf_id}")],
-                [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                [InlineKeyboardButton("⏹ إلغاء أوامر الشراء المعلّقة", callback_data="crash_cancel_sys")],
+                [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
             ]
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
         finally:
             db.close()
         return
 
-    if data.startswith("crash_set_levels_"):
-        pf_id = int(data.split("_")[-1])
+    if data == "crash_set_levels_sys" or data.startswith("crash_set_levels_"):
         context.user_data["waiting"] = True
-        context.user_data["crash_wait"] = {"pf_id": pf_id, "kind": "levels"}
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "levels"}
         await query.edit_message_text(
-            "أرسل نسب السلم مفصولة بفاصلة.\nمثال: `-10,-20,-30`\n(السالب اختياري)",
+            "أرسل نسب السلم مفصولة بفاصلة.\nمثال: `-10,-20,-30`",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ رجوع", callback_data=f"crash_{pf_id}")],
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="crash_sys")],
             ]),
         )
         return
 
-    if data.startswith("crash_set_budget_"):
-        pf_id = int(data.split("_")[-1])
+    if data == "crash_set_budget_sys" or data.startswith("crash_set_budget_"):
         context.user_data["waiting"] = True
-        context.user_data["crash_wait"] = {"pf_id": pf_id, "kind": "budget"}
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "budget"}
         await query.edit_message_text(
-            "أرسل ميزانية اصطياد الانهيار بالدولار (مجموع أوامر الحد).",
+            "أرسل ميزانية اصطياد الانهيار بالدولار (مجموع أوامر الحد لكل العملات).",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ رجوع", callback_data=f"crash_{pf_id}")],
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="crash_sys")],
             ]),
         )
         return
 
-    if data.startswith("crash_run_"):
-        pf_id = int(data.split("_")[-1])
+    if data == "crash_run_sys" or data.startswith("crash_run_"):
         db = SessionLocal()
         try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p or not p.coins:
-                await query.edit_message_text("لا عملات في المحفظة.", reply_markup=main_menu_keyboard())
+            pfs = get_portfolios(db, tid, status="active") or []
+            symbols = []
+            seen = set()
+            for p in pfs:
+                for c in (p.coins or []):
+                    s = (c.symbol or "").upper()
+                    if s and s not in seen:
+                        seen.add(s)
+                        symbols.append(s)
+            if not symbols:
+                await query.edit_message_text(
+                    "لا عملات في المحافظ. أنشئ محافظ وأضف عملات أولاً.",
+                    reply_markup=main_menu_keyboard(),
+                )
                 return
             levels = context.user_data.get("crash_levels") or default_manual_levels()
             budget = float(context.user_data.get("crash_budget") or 0)
             if budget < 10:
-                budget = max(20.0, float(p.investment_usdt or 0) * 0.5)
-            symbols = [c.symbol for c in p.coins]
-            await query.edit_message_text("⏳ جاري وضع أوامر السلم اليدوي…")
+                budget = 50.0
+            await query.edit_message_text(
+                f"⏳ وضع أوامر السلم اليدوي على `{len(symbols)}` عملة…"
+            )
             client = get_mexc()
             res = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: place_crash_ladder(client, symbols, levels, budget, mode="manual"),
             )
-            log_action(db, tid, "crash_manual", f"pf={pf_id} placed={len(res.get('placed') or [])}", True, pf_id)
+            log_action(db, tid, "crash_manual_sys", f"n={len(symbols)} placed={len(res.get('placed') or [])}", True)
             await query.edit_message_text(
-                format_crash_result(res, f"اصطياد يدوي — {p.name}"),
+                format_crash_result(res, "اصطياد يدوي — كل المحافظ"),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎯 الاصطياد", callback_data=f"crash_{pf_id}")],
-                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                    [InlineKeyboardButton("🎯 الاصطياد", callback_data="crash_sys")],
+                    [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
                 ]),
             )
         except Exception as e:
-            logger.exception("crash_run")
-            await query.edit_message_text(f"❌ فشل الاصطياد اليدوي:\n`{e}`", parse_mode="Markdown")
+            logger.exception("crash_run_sys")
+            await query.edit_message_text(f"❌ فشل:\n`{e}`", parse_mode="Markdown")
         finally:
             db.close()
         return
 
-    if data.startswith("crash_auto_"):
-        pf_id = int(data.split("_")[-1])
+    if data == "crash_auto_sys" or data.startswith("crash_auto_"):
         db = SessionLocal()
         try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p or not p.coins:
-                await query.edit_message_text("لا عملات في المحفظة.", reply_markup=main_menu_keyboard())
+            pfs = get_portfolios(db, tid, status="active") or []
+            symbols = []
+            seen = set()
+            for p in pfs:
+                for c in (p.coins or []):
+                    s = (c.symbol or "").upper()
+                    if s and s not in seen:
+                        seen.add(s)
+                        symbols.append(s)
+            if not symbols:
+                await query.edit_message_text("لا عملات في المحافظ.", reply_markup=main_menu_keyboard())
                 return
             budget = float(context.user_data.get("crash_budget") or 0)
             if budget < 10:
-                budget = max(20.0, float(p.investment_usdt or 0) * 0.5)
-            symbols = [c.symbol for c in p.coins]
-            await query.edit_message_text("⏳ تحليل السوق ثم وضع السلم…")
+                budget = 50.0
+            await query.edit_message_text("⏳ تحليل السوق ثم وضع السلم على كل العملات…")
             client = get_mexc()
             levels, reason = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: analyze_market_for_auto(client),
@@ -918,44 +930,44 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 None,
                 lambda: place_crash_ladder(client, symbols, levels, budget, mode="auto"),
             )
-            res["reason"] = reason
-            log_action(db, tid, "crash_auto", reason[:120], True, pf_id)
-            text = format_crash_result(res, f"اصطياد تلقائي — {p.name}")
-            text = f"📡 {reason}\n\n" + text
+            log_action(db, tid, "crash_auto_sys", reason[:120], True)
+            text = f"📡 {reason}\n\n" + format_crash_result(res, "اصطياد تلقائي — كل المحافظ")
             await query.edit_message_text(
                 text,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎯 الاصطياد", callback_data=f"crash_{pf_id}")],
-                    [InlineKeyboardButton("⬅️ المحفظة", callback_data=f"view_{pf_id}")],
+                    [InlineKeyboardButton("🎯 الاصطياد", callback_data="crash_sys")],
+                    [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
                 ]),
             )
         except Exception as e:
-            logger.exception("crash_auto")
-            await query.edit_message_text(f"❌ فشل الاصطياد التلقائي:\n`{e}`", parse_mode="Markdown")
+            logger.exception("crash_auto_sys")
+            await query.edit_message_text(f"❌ فشل:\n`{e}`", parse_mode="Markdown")
         finally:
             db.close()
         return
 
-    if data.startswith("crash_cancel_"):
-        pf_id = int(data.split("_")[-1])
+    if data == "crash_cancel_sys" or data.startswith("crash_cancel_"):
         db = SessionLocal()
         try:
-            p = get_portfolio(db, pf_id, tid)
-            if not p:
-                await query.edit_message_text("غير موجودة.")
-                return
-            symbols = [c.symbol for c in (p.coins or [])]
+            pfs = get_portfolios(db, tid, status="active") or []
+            symbols = []
+            seen = set()
+            for p in pfs:
+                for c in (p.coins or []):
+                    s = (c.symbol or "").upper()
+                    if s and s not in seen:
+                        seen.add(s)
+                        symbols.append(s)
             client = get_mexc()
             r = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: cancel_crash_orders(client, symbols),
             )
             await query.edit_message_text(
-                f"🗑 تم إلغاء `{r.get('cancelled', 0)}` أمر شراء معلّق.\n"
-                + ("\n".join(f"• {e}" for e in (r.get("errors") or [])[:5])),
-                parse_mode="Markdown",
+                f"⏹ تم إلغاء `{r.get('cancelled', 0)}` أمر شراء معلّق.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ الاصطياد", callback_data=f"crash_{pf_id}")],
+                    [InlineKeyboardButton("🎯 الاصطياد", callback_data="crash_sys")],
+                    [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
                 ]),
             )
         finally:
@@ -993,7 +1005,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "balance":
         try:
-            import asyncio
             loop = asyncio.get_event_loop()
             info = await loop.run_in_executor(None, lambda: get_mexc().get_portfolio_value())
             total = float(info.get("total_usdt") or 0)
@@ -1303,7 +1314,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("mode_"):
         """تبديل ذكي ↔ يدوي بدون أي بيع — تحديث الوضع + الأوامر فقط."""
-        import asyncio
         confirming_manual = data.startswith("mode_confirm_")
         pf_id = int(data.split("_")[-1])
         db = SessionLocal()
@@ -1604,7 +1614,6 @@ async def _do_rebuild_positions(query, tid, pf_id):
     3) شراء العملات الناقصة
     4) إعادة وضع أهداف TP/SL الجديدة
     """
-    import asyncio
     import time
 
     db = SessionLocal()
@@ -2031,7 +2040,6 @@ async def _do_rebuild_positions(query, tid, pf_id):
 
 async def _do_refresh_tpsl(query, tid, pf_id):
     """تحويل المراكز المفتوحة لنظام الوقف المتحرك بدون أي بيع."""
-    import asyncio
     import time as _time
 
     db = SessionLocal()
@@ -2208,7 +2216,6 @@ async def _do_refresh_tpsl(query, tid, pf_id):
 
 async def _show_missing_reentry(query, context, tid, pf_id, toggle_symbol=None):
     """Show missing portfolio coins and let the user build a buy selection."""
-    import asyncio
 
     db = SessionLocal()
     try:
@@ -2313,7 +2320,6 @@ async def _show_missing_reentry(query, context, tid, pf_id, toggle_symbol=None):
 
 async def _do_missing_reentry(query, context, tid, pf_id):
     """Re-check and buy only the coins explicitly confirmed by the user."""
-    import asyncio
 
     key = _missing_selection_key(pf_id)
     if context.user_data.get(f"{key}_in_progress"):
@@ -2521,7 +2527,6 @@ async def _do_missing_reentry(query, context, tid, pf_id):
 
 async def _do_manual_reentry(query, tid, event_id):
     """Buy a stopped coin again only after the user presses its button."""
-    import asyncio
 
     db = SessionLocal()
     try:
@@ -2609,7 +2614,6 @@ async def _do_manual_reentry(query, tid, event_id):
 
 
 async def _do_start(query, tid, pf_id):
-    import asyncio
 
     db = SessionLocal()
     try:
@@ -2813,7 +2817,6 @@ async def _do_start(query, tid, pf_id):
 
 async def _do_stop(query, tid, pf_id):
     """إيقاف المحفظة: إلغاء الأوامر + بيع كل العملات بسعر السوق."""
-    import asyncio
 
     db = SessionLocal()
     try:
@@ -2987,7 +2990,6 @@ async def _do_stop(query, tid, pf_id):
 
 async def _do_remove_coin(query, tid, pf_id, symbol):
     """حذف عملة: إلغاء أوامرها ثم بيع الرصيد بسعر السوق ثم شيلها من القاعدة."""
-    import asyncio
     import time as _time
 
     db = SessionLocal()
@@ -3308,7 +3310,7 @@ async def increase_amount_msg(update: Update, context: ContextTypes.DEFAULT_TYPE
                 coins=coins,
                 total_usdt=amount,
                 method="equal",
-                min_trade_usdt=5.0,
+                min_trade_usdt=1.0,
                 dry_run=False,
             ) or {}
         except Exception as e:
@@ -3435,7 +3437,6 @@ async def market_sense_job(context: ContextTypes.DEFAULT_TYPE):
     - black/crash: خروج دفاعي (بيع المراكز في المحافظ التلقائية)
     - حد خسارة يومي من قمة اليوم
     """
-    import asyncio
     db = SessionLocal()
     try:
         client = get_mexc()
@@ -3607,7 +3608,6 @@ async def smart_levels_refresh_job(context: ContextTypes.DEFAULT_TYPE):
     - OHLCV يُجلب فقط للعملات المختارة
     - أوامر المنصة تتغير فقط لو الفرق معنوي
     """
-    import asyncio
     import time as _time
 
     db = SessionLocal()
@@ -3762,7 +3762,6 @@ async def cpr_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
     """Background job: check open positions for TP fill / SL hit / re-entry."""
-    import asyncio
     db = SessionLocal()
     try:
         positions = get_open_positions(db)
