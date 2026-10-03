@@ -24,6 +24,8 @@ import crash_hunter
 from crash_hunter import (
     parse_levels, default_manual_levels, analyze_market_for_auto,
     place_crash_ladder, cancel_crash_orders, format_result as format_crash_result,
+    update_settings as crash_update_settings, get_settings as crash_get_settings,
+    monitor_crash_fills, status_summary as crash_status_summary,
 )
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
@@ -620,22 +622,22 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         crash_wait = context.user_data.get("crash_wait")
         if crash_wait:
             pf_id = int(crash_wait.get("pf_id") or 0)
-            kind = crash_wait.get("kind")  # levels | budget
+            kind = crash_wait.get("kind")  # levels | budget | max_coin | tp | sl
             try:
                 if kind == "levels":
                     levels = parse_levels(text)
                     if not levels:
                         await update.message.reply_text(
-                            "صيغة غير مفهومة. مثال: `-10,-20,-30`",
+                            "صيغة غير مفهومة. مثال: `-10,-20`",
                             reply_markup=main_menu_keyboard(),
                         )
                         return
                     context.user_data["crash_levels"] = levels
+                    crash_update_settings(levels_pct=levels)
                     context.user_data.pop("crash_wait", None)
                     context.user_data.pop("waiting", None)
                     await update.message.reply_text(
-                        f"✅ نسب السلم: `{', '.join(str(x) for x in levels)}` %\n"
-                        f"من القائمة → اصطياد الانهيار → تشغيل",
+                        f"✅ نسب السلم: `{', '.join(str(x) for x in levels)}` %\nمن القائمة → اصطياد → تشغيل",
                         parse_mode="Markdown",
                         reply_markup=main_menu_keyboard(),
                     )
@@ -644,10 +646,47 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     val = float(text.strip().replace(",", ".").replace("$", ""))
                     val = max(10.0, min(100000.0, val))
                     context.user_data["crash_budget"] = val
+                    crash_update_settings(budget_usdt=val)
                     context.user_data.pop("crash_wait", None)
                     context.user_data.pop("waiting", None)
                     await update.message.reply_text(
                         f"✅ ميزانية الاصطياد: `{val:g}$`",
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                    return
+                if kind == "max_coin":
+                    val = float(text.strip().replace(",", ".").replace("$", ""))
+                    val = max(5.0, min(10000.0, val))
+                    crash_update_settings(max_per_coin_usdt=val)
+                    context.user_data.pop("crash_wait", None)
+                    context.user_data.pop("waiting", None)
+                    await update.message.reply_text(
+                        f"✅ سقف لكل عملة: `{val:g}$`",
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                    return
+                if kind == "tp":
+                    val = float(text.strip().replace(",", ".").replace("%", ""))
+                    val = max(1.0, min(100.0, val))
+                    crash_update_settings(tp_pct=val)
+                    context.user_data.pop("crash_wait", None)
+                    context.user_data.pop("waiting", None)
+                    await update.message.reply_text(
+                        f"✅ هدف بعد الامتلاء: `{val:g}%`",
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                    return
+                if kind == "sl":
+                    val = float(text.strip().replace(",", ".").replace("%", ""))
+                    val = max(1.0, min(50.0, val))
+                    crash_update_settings(sl_pct=val)
+                    context.user_data.pop("crash_wait", None)
+                    context.user_data.pop("waiting", None)
+                    await update.message.reply_text(
+                        f"✅ وقف بعد الامتلاء: `{val:g}%`",
                         parse_mode="Markdown",
                         reply_markup=main_menu_keyboard(),
                     )
@@ -807,27 +846,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if s and s not in seen:
                         seen.add(s)
                         symbols.append(s)
+            cs = crash_get_settings()
             if budget < 10:
-                budget = 50.0
+                budget = float(cs.budget_usdt or 50)
             text = (
                 f"🎯 *اصطياد الانهيار — نظام عام*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"يُطبَّق *مرة واحدة* على عملات *كل المحافظ*\n"
-                f"المحافظ: `{len(pfs)}` | العملات الفريدة: `{len(symbols)}`\n"
-                f"ميزانية الأوامر: `{budget:.0f}$`\n"
-                f"السلم اليدوي: `{', '.join(str(x) for x in levels)}` %\n\n"
-                f"▶️ يدوي: نسبك → أوامر حد شراء\n"
-                f"▶️ تلقائي: تحليل BTC يختار السلم ثم الأوامر\n\n"
-                f"_USDT يجب أن يكون متاحًا. الأوامر معلّقة حتى يهبط السعر._"
+                f"المحافظ: `{len(pfs)}` | العملات: `{len(symbols)}`\n"
+                f"ميزانية: `{budget:.0f}$` | سقف/عملة: `{cs.max_per_coin_usdt:g}$`\n"
+                f"السلم: `{', '.join(str(x) for x in levels)}` %\n"
+                f"بعد الامتلاء: هدف `{cs.tp_pct:g}%` | وقف `{cs.sl_pct:g}%`\n"
+                f"{crash_status_summary()}\n\n"
+                f"_بعد الامتلاء: هدف حد + مراقبة وقف._"
             )
             rows = [
-                [InlineKeyboardButton("▶️ تشغيل يدوي (كل المحافظ)", callback_data="crash_run_sys")],
-                [InlineKeyboardButton("▶️ تشغيل تلقائي (كل المحافظ)", callback_data="crash_auto_sys")],
+                [InlineKeyboardButton("▶️ تشغيل يدوي", callback_data="crash_run_sys")],
+                [InlineKeyboardButton("▶️ تشغيل تلقائي", callback_data="crash_auto_sys")],
                 [
-                    InlineKeyboardButton("⚙️ نسب السلم", callback_data="crash_set_levels_sys"),
-                    InlineKeyboardButton("💵 الميزانية", callback_data="crash_set_budget_sys"),
+                    InlineKeyboardButton("⚙️ السلم", callback_data="crash_set_levels_sys"),
+                    InlineKeyboardButton("💵 ميزانية", callback_data="crash_set_budget_sys"),
                 ],
-                [InlineKeyboardButton("⏹ إلغاء أوامر الشراء المعلّقة", callback_data="crash_cancel_sys")],
+                [
+                    InlineKeyboardButton("سقف/عملة", callback_data="crash_set_max_sys"),
+                    InlineKeyboardButton("هدف%", callback_data="crash_set_tp_sys"),
+                    InlineKeyboardButton("وقف%", callback_data="crash_set_sl_sys"),
+                ],
+                [InlineKeyboardButton("⏹ إلغاء أوامر معلّقة", callback_data="crash_cancel_sys")],
                 [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
             ]
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
@@ -839,7 +884,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting"] = True
         context.user_data["crash_wait"] = {"pf_id": 0, "kind": "levels"}
         await query.edit_message_text(
-            "أرسل نسب السلم مفصولة بفاصلة.\nمثال: `-10,-20,-30`",
+            "أرسل نسب السلم مفصولة بفاصلة.\nمثال: `-10,-20`",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ رجوع", callback_data="crash_sys")],
             ]),
@@ -850,7 +895,40 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting"] = True
         context.user_data["crash_wait"] = {"pf_id": 0, "kind": "budget"}
         await query.edit_message_text(
-            "أرسل ميزانية اصطياد الانهيار بالدولار (مجموع أوامر الحد لكل العملات).",
+            "أرسل ميزانية الاصطياد بالدولار (مستقلة عن مخصص المحافظ).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="crash_sys")],
+            ]),
+        )
+        return
+
+    if data == "crash_set_max_sys":
+        context.user_data["waiting"] = True
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "max_coin"}
+        await query.edit_message_text(
+            "أرسل سقف المبلغ لكل عملة بالدولار (مثال: 25).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="crash_sys")],
+            ]),
+        )
+        return
+
+    if data == "crash_set_tp_sys":
+        context.user_data["waiting"] = True
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "tp"}
+        await query.edit_message_text(
+            "أرسل نسبة الهدف بعد امتلاء أمر الاصطياد (مثال: 8).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="crash_sys")],
+            ]),
+        )
+        return
+
+    if data == "crash_set_sl_sys":
+        context.user_data["waiting"] = True
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "sl"}
+        await query.edit_message_text(
+            "أرسل نسبة الوقف تحت سعر الامتلاء (مثال: 5).",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ رجوع", callback_data="crash_sys")],
             ]),
@@ -3755,13 +3833,24 @@ async def smart_levels_refresh_job(context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
-
-async def cpr_job(context: ContextTypes.DEFAULT_TYPE):
-    return
-
-
 async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background job: check open positions for TP fill / SL hit / re-entry."""
+    """مراقبة المراكز + امتلاء أوامر اصطياد الانهيار."""
+    # اصطياد: امتلاء / هدف / وقف
+    try:
+        crash_msgs = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: monitor_crash_fills(get_mexc()),
+        )
+        admin_id = getattr(config, "ADMIN_TELEGRAM_ID", None)
+        for cm in crash_msgs or []:
+            if not admin_id:
+                break
+            try:
+                await context.bot.send_message(admin_id, cm, parse_mode="Markdown")
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("monitor_crash_fills")
+
     db = SessionLocal()
     try:
         positions = get_open_positions(db)
@@ -4260,13 +4349,6 @@ def main():
 
     # Cloud monitor for TP/SL every 25 seconds
     if app.job_queue:
-        app.job_queue.run_repeating(
-            cpr_job,
-            interval=45,
-            first=20,
-            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
-        )
-        logger.info("CPR job scheduled (every 45s)")
         app.job_queue.run_repeating(
             monitor_positions_job,
             interval=60,
