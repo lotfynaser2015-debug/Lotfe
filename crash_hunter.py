@@ -13,6 +13,8 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+from orderbook_engine import analyze_btc_eth_pressure
+
 
 @dataclass
 class CrashSettings:
@@ -77,43 +79,16 @@ def default_manual_levels() -> List[float]:
     return [-10.0, -20.0]
 
 
-def analyze_market_for_auto(client) -> Tuple[List[float], str]:
-    chg_1h = 0.0
-    chg_4h = 0.0
-    try:
-        ex = client.exchange
-        if not getattr(ex, "markets", None):
-            ex.load_markets()
-        ohlcv = ex.fetch_ohlcv("BTC/USDT", timeframe="1h", limit=6)
-        if ohlcv and len(ohlcv) >= 2:
-            c0 = float(ohlcv[-2][4])
-            c1 = float(ohlcv[-1][4])
-            if c0 > 0:
-                chg_1h = (c1 / c0 - 1.0) * 100.0
-        ohlcv4 = ex.fetch_ohlcv("BTC/USDT", timeframe="4h", limit=4)
-        if ohlcv4 and len(ohlcv4) >= 2:
-            a = float(ohlcv4[-2][4])
-            b = float(ohlcv4[-1][4])
-            if a > 0:
-                chg_4h = (b / a - 1.0) * 100.0
-    except Exception as e:
-        logger.warning("auto crash analyze fail: %s", e)
-        return [-12.0, -22.0], "تحليل افتراضي (تعذر قراءة BTC)"
 
-    drop = min(chg_1h, chg_4h)
-    if drop <= -6:
-        levels = [-15.0, -30.0]
-        reason = f"هبوط حاد BTC 1h={chg_1h:+.1f}% 4h={chg_4h:+.1f}% → مستويان عميقان"
-    elif drop <= -3:
-        levels = [-12.0, -24.0]
-        reason = f"هبوط متوسط BTC 1h={chg_1h:+.1f}% 4h={chg_4h:+.1f}%"
-    elif drop <= -1:
-        levels = [-8.0, -16.0]
-        reason = f"ضعف خفيف BTC 1h={chg_1h:+.1f}% 4h={chg_4h:+.1f}%"
-    else:
-        levels = [-10.0, -20.0]
-        reason = f"سوق مستقر نسبيًا BTC 1h={chg_1h:+.1f}% 4h={chg_4h:+.1f}% → سلم وقائي"
-    return levels, reason
+def analyze_market_for_auto(client):
+    """تحليل Binance+MEXC → سلم مستويين + سبب. يُرجِع أيضاً مضاعف ميزانية عبر attribute على القائمة."""
+    plan = analyze_btc_eth_pressure(client)
+    levels = list(plan.levels)[:2]
+    # نحفظ المضاعف ليستخدمه المستدعي
+    analyze_market_for_auto.last_budget_mult = float(plan.budget_mult)
+    analyze_market_for_auto.last_regime = plan.regime
+    return levels, plan.reason
+
 
 
 def place_crash_ladder(
@@ -141,6 +116,10 @@ def place_crash_ladder(
     if not symbols or not levels_pct or budget_usdt < 5:
         result["errors"].append("لا عملات أو ميزانية/مستويات غير كافية")
         return result
+
+    # حد أقصى مستويان — حتى لو الإعدادات القديمة فيها 3
+    levels_pct = list(levels_pct)[:2]
+    result["levels"] = levels_pct
 
     try:
         free = float(client.get_free_usdt() or 0)

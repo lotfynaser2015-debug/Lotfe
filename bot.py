@@ -27,6 +27,11 @@ from crash_hunter import (
     update_settings as crash_update_settings, get_settings as crash_get_settings,
     monitor_crash_fills, status_summary as crash_status_summary,
 )
+import book_trader
+from book_trader import (
+    BookSettings, start as book_start, stop as book_stop,
+    status_text as book_status, tick as book_tick, get_runtime as get_book_runtime,
+)
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
@@ -131,6 +136,7 @@ def main_menu_keyboard():
             InlineKeyboardButton("➕ محفظة جديدة", callback_data="create_pf"),
         ],
         [InlineKeyboardButton("🎯 اصطياد الانهيار (كل المحافظ)", callback_data="crash_sys")],
+        [InlineKeyboardButton("📊 دفتر الأوامر (دخول/خروج)", callback_data="book_menu")],
         [InlineKeyboardButton("📡 حالة السوق", callback_data="auto_sys_status")],
         [InlineKeyboardButton("💰 الرصيد", callback_data="balance")],
         [
@@ -695,6 +701,46 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"خطأ: {e}")
                 return
 
+        book_field = context.user_data.get("edit_book_field")
+        if book_field:
+            try:
+                raw = text.strip()
+                rt = get_book_runtime()
+                s = rt.settings
+                if book_field == "coins":
+                    coins = []
+                    for part in raw.replace("\n", ",").split(","):
+                        sym = part.strip().upper().replace("/USDT", "")
+                        if sym and sym.isalnum() and 2 <= len(sym) <= 15 and sym not in coins:
+                            coins.append(sym)
+                    if not coins:
+                        await update.message.reply_text("لا رموز صالحة.")
+                        return
+                    s.coins = coins[:30]
+                    val = f"{len(coins)} عملة"
+                elif book_field == "size":
+                    s.size_usdt = max(5.0, min(5000.0, float(raw.replace(",", ".").replace("$", ""))))
+                    val = s.size_usdt
+                elif book_field == "max_pos":
+                    s.max_positions = max(1, min(20, int(float(raw))))
+                    val = s.max_positions
+                elif book_field == "strength":
+                    s.min_strength = max(40.0, min(90.0, float(raw.replace(",", "."))))
+                    val = s.min_strength
+                else:
+                    await update.message.reply_text("حقل غير معروف")
+                    return
+                context.user_data.pop("edit_book_field", None)
+                context.user_data.pop("waiting", None)
+                await update.message.reply_text(
+                    f"✅ دفتر: `{book_field}` = `{val}`",
+                    parse_mode="Markdown",
+                    reply_markup=main_menu_keyboard(),
+                )
+            except Exception as e:
+                await update.message.reply_text(f"خطأ: {e}")
+            return
+
         user_field = context.user_data.get("edit_user_tpsl")
         if user_field:
             try:
@@ -1004,9 +1050,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             levels, reason = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: analyze_market_for_auto(client),
             )
+            mult = float(getattr(analyze_market_for_auto, "last_budget_mult", 1.0) or 1.0)
+            adj_budget = max(10.0, budget * mult)
             res = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: place_crash_ladder(client, symbols, levels, budget, mode="auto"),
+                lambda: place_crash_ladder(client, symbols, levels, adj_budget, mode="auto"),
             )
             log_action(db, tid, "crash_auto_sys", reason[:120], True)
             text = f"📡 {reason}\n\n" + format_crash_result(res, "اصطياد تلقائي — كل المحافظ")
@@ -1050,6 +1098,109 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         finally:
             db.close()
+        return
+
+
+    # ========== دفتر الأوامر دخول/خروج ==========
+    if data == "book_menu":
+        rt = get_book_runtime()
+        s = rt.settings
+        text = book_status(get_mexc() if rt.active else None)
+        rows = []
+        if not rt.active:
+            rows.append([InlineKeyboardButton("▶️ تشغيل", callback_data="book_start")])
+        else:
+            rows.append([InlineKeyboardButton("⏹ إيقاف", callback_data="book_stop")])
+        mode_lab = "🧪 تجريبي" if s.mode == "paper" else "💰 حقيقي"
+        rows.append([InlineKeyboardButton(f"الوضع: {mode_lab}", callback_data="book_toggle_mode")])
+        rows.append([
+            InlineKeyboardButton(f"صفقة ${s.size_usdt:g}", callback_data="book_set_size"),
+            InlineKeyboardButton(f"أقصى {s.max_positions}", callback_data="book_set_max_pos"),
+        ])
+        rows.append([
+            InlineKeyboardButton(f"عملات ({len(s.coins)})", callback_data="book_set_coins"),
+            InlineKeyboardButton(f"قوة≥{s.min_strength:g}", callback_data="book_set_strength"),
+        ])
+        rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="book_menu")])
+        rows.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu")])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "book_toggle_mode":
+        rt = get_book_runtime()
+        if rt.active:
+            await query.edit_message_text("أوقف النظام أولًا.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 دفتر", callback_data="book_menu")],
+            ]))
+            return
+        rt.settings.mode = "live" if rt.settings.mode == "paper" else "paper"
+        ar = "حقيقي" if rt.settings.mode == "live" else "تجريبي"
+        await query.edit_message_text(f"الوضع: *{ar}*", parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 دفتر", callback_data="book_menu")]]))
+        return
+
+    if data == "book_start":
+        rt = get_book_runtime()
+        s = rt.settings
+        if not s.coins:
+            await query.edit_message_text(
+                "حدّد العملات أولًا (مثال: BTC,ETH,SEI).",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 دفتر", callback_data="book_menu")]]),
+            )
+            return
+        if s.mode == "live":
+            await query.edit_message_text(
+                "⚠️ *وضع حقيقي* — تأكيد التشغيل؟",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ تأكيد", callback_data="book_start_live")],
+                    [InlineKeyboardButton("⬅️ رجوع", callback_data="book_menu")],
+                ]),
+            )
+            return
+        msg = book_start(tid, s)
+        await query.edit_message_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏹ إيقاف", callback_data="book_stop")],
+                [InlineKeyboardButton("📊 دفتر", callback_data="book_menu")],
+            ]))
+        return
+
+    if data == "book_start_live":
+        rt = get_book_runtime()
+        rt.settings.mode = "live"
+        msg = book_start(tid, rt.settings)
+        await query.edit_message_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏹ إيقاف", callback_data="book_stop")],
+                [InlineKeyboardButton("📊 دفتر", callback_data="book_menu")],
+            ]))
+        return
+
+    if data == "book_stop":
+        msg = book_stop(get_mexc())
+        await query.edit_message_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 دفتر", callback_data="book_menu")],
+                [InlineKeyboardButton("⬅️ القائمة", callback_data="menu")],
+            ]))
+        return
+
+    if data.startswith("book_set_"):
+        field = data[len("book_set_"):]
+        labels = {
+            "size": "حجم الصفقة بالدولار",
+            "max_pos": "أقصى مراكز (1–20)",
+            "coins": "العملات بفاصلة (BTC,ETH,SEI)",
+            "strength": "حد أدنى لقوة الإشارة (40–90، افتراضي 60)",
+        }
+        context.user_data["waiting"] = True
+        context.user_data["edit_book_field"] = field
+        await query.edit_message_text(
+            f"أرسل *{labels.get(field, field)}*:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="book_menu")]]),
+        )
         return
 
     if data == "list_pf":
@@ -3850,6 +4001,21 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 pass
     except Exception:
         logger.exception("monitor_crash_fills")
+
+    try:
+        book_msgs = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: book_tick(get_mexc()),
+        )
+        admin_id = getattr(config, "ADMIN_TELEGRAM_ID", None)
+        for bm in book_msgs or []:
+            if not admin_id:
+                break
+            try:
+                await context.bot.send_message(admin_id, bm, parse_mode="Markdown")
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("book_tick")
 
     db = SessionLocal()
     try:
